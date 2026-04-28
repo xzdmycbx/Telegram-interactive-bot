@@ -129,12 +129,9 @@ async def send_contact_card(
             [InlineKeyboardButton("👤 直接联络", url=f"https://t.me/{user.username}")]
         )
 
-    membership = "🏆 Premium" if user.is_premium else "✈️ 普通"
     caption = (
-        f"👤 {mention_html(user.id, user.first_name)}\n\n"
-        f"📱 {user.id}\n\n"
-        f"🔗 @{user.username if user.username else '无'}\n\n"
-        f"💎 会员：{membership}"
+        f"{mention_html(user.id, user.full_name)}\n"
+        f"{'🏆 Premium' if user.is_premium else '✈️ 普通会员'}"
     )
     reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
 
@@ -163,7 +160,6 @@ async def send_contact_card(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     update_user_db(user)
-    # check whether is admin
     if user.id in admin_user_ids:
         logger.info(f"{user.first_name}({user.id}) is admin")
         try:
@@ -177,12 +173,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
         await update.message.reply_html(
-            f"你好管理员 {user.first_name}({user.id})\n\n欢迎使用 {app_name} 机器人。\n\n 目前你的配置完全正确。可以在群组 <b> {bg.title} </b> 中使用机器人。"
+            f"你好管理员 {mention_html(user.id, user.first_name)}，配置正确，后台群组：<b>{bg.title}</b>\n\n"
+            f"<b>可用指令：</b>\n\n"
+            f"▸ <code>/start</code>\n  检测机器人配置是否正确\n\n"
+            f"▸ <code>/clear</code>（在话题内执行）\n  删除当前话题，可选同步清除用户侧消息\n\n"
+            f"▸ <code>/broadcast</code>（回复一条消息后执行）\n  将被回复的消息广播给所有用户"
         )
     else:
         await update.message.reply_html(
             f"{mention_html(user.id, user.full_name)} 同学：\n\n{welcome_message}"
         )
+        if not disable_captcha:
+            if user.is_premium:
+                context.user_data["is_human"] = True
+                await update.message.reply_html("您作为 Premium 用户已自动跳过人机验证。")
+            else:
+                await check_human(update, context)
 
 
 async def check_human(update: Update, context: ContextTypes.DEFAULT_TYPE):
