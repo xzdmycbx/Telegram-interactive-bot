@@ -35,6 +35,7 @@ from . import (
     welcome_message,
     disable_captcha,
     message_interval,
+    general_topic_id,
 )
 from .utils import delete_message_later
 
@@ -291,6 +292,13 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode="HTML",
         )
         await send_contact_card(chat_id, message_thread_id, user, update, context)
+        if general_topic_id is not None:
+            username_display = f"@{user.username}" if user.username else user.full_name
+            await context.bot.send_message(
+                chat_id,
+                f"有新的用户发起了私聊，用户名为：{username_display}",
+                message_thread_id=general_topic_id,
+            )
         db.add(u)
         db.commit()
 
@@ -476,20 +484,23 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.delete_forum_topic(
         update.effective_chat.id, update.message.message_thread_id
     )
-    if not is_delete_user_messages:
-        return
-    if (
-        target_user := db.query(User)
+    target_user = (
+        db.query(User)
         .filter(User.message_thread_id == update.message.message_thread_id)
         .first()
-    ):
-        all_messages_in_user_chat = (
-            db.query(MessageMap).filter(MessageMap.user_id == target_user.user_id).all()
-        )
-        await context.bot.delete_messages(
-            target_user.user_id,
-            [msg.user_chat_message_id for msg in all_messages_in_user_chat],
-        )
+    )
+    if target_user:
+        target_user.message_thread_id = 0
+        db.add(target_user)
+        db.commit()
+        if is_delete_user_messages:
+            all_messages_in_user_chat = (
+                db.query(MessageMap).filter(MessageMap.user_id == target_user.user_id).all()
+            )
+            await context.bot.delete_messages(
+                target_user.user_id,
+                [msg.user_chat_message_id for msg in all_messages_in_user_chat],
+            )
 
 
 async def _broadcast(context: ContextTypes.DEFAULT_TYPE):

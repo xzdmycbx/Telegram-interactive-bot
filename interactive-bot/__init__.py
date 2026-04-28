@@ -34,3 +34,6 @@ is_delete_topic_as_ban_forever = os.getenv("DELETE_TOPIC_AS_FOREVER_BAN") == "TR
 is_delete_user_messages = os.getenv("DELETE_USER_MESSAGE_ON_CLEAR_CMD") == "TRUE"
 disable_captcha = os.getenv("DISABLE_CAPTCHA") == "TRUE"
 message_interval = int(os.getenv("MESSAGE_INTERVAL", 3))
+
+_general_topic_id_raw = os.getenv("GENERAL_TOPIC_ID", "").strip()
+general_topic_id = int(_general_topic_id_raw) if _general_topic_id_raw else None
