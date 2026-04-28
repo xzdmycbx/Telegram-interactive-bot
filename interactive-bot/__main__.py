@@ -16,6 +16,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    MessageReactionHandler,
     PicklePersistence,
     filters,
 )
@@ -292,13 +293,12 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode="HTML",
         )
         await send_contact_card(chat_id, message_thread_id, user, update, context)
-        if general_topic_id is not None:
-            username_display = f"@{user.username}" if user.username else user.full_name
-            await context.bot.send_message(
-                chat_id,
-                f"有新的用户发起了私聊，用户名为：{username_display}",
-                message_thread_id=general_topic_id,
-            )
+        username_display = f"@{user.username}" if user.username else user.full_name
+        await context.bot.send_message(
+            chat_id,
+            f"有新的用户发起了私聊，用户名为：{username_display}",
+            message_thread_id=general_topic_id or None,
+        )
         db.add(u)
         db.commit()
 
@@ -589,6 +589,54 @@ async def error_in_send_media_group(update: Update, context: ContextTypes.DEFAUL
     return ConversationHandler.END
 
 
+async def forwarding_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reaction = update.message_reaction
+    if not reaction:
+        return
+
+    chat_id = reaction.chat.id
+    message_id = reaction.message_id
+    new_reaction = list(reaction.new_reaction)  # 空列表 = 取消表情
+
+    if chat_id == admin_group_id:
+        # 管理员群 react → 转发给用户
+        msg_map = (
+            db.query(MessageMap)
+            .filter(MessageMap.group_chat_message_id == message_id)
+            .first()
+        )
+        if not msg_map:
+            return
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=msg_map.user_id,
+                message_id=msg_map.user_chat_message_id,
+                reaction=new_reaction,
+            )
+        except Exception:
+            pass
+    else:
+        # 用户 react → 转发到管理员群
+        msg_map = (
+            db.query(MessageMap)
+            .filter(
+                MessageMap.user_chat_message_id == message_id,
+                MessageMap.user_id == chat_id,
+            )
+            .first()
+        )
+        if not msg_map:
+            return
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=admin_group_id,
+                message_id=msg_map.group_chat_message_id,
+                reaction=new_reaction,
+            )
+        except Exception:
+            pass
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log the error and send a telegram message to notify the developer."""
     # Log the error before we do anything else, so we can see it even if something breaks.
@@ -626,5 +674,6 @@ if __name__ == "__main__":
     application.add_handler(
         CallbackQueryHandler(callback_query_vcode, pattern="^vcode_")
     )
+    application.add_handler(MessageReactionHandler(forwarding_reaction))
     application.add_error_handler(error_handler)
-    application.run_polling()
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
