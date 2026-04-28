@@ -63,11 +63,36 @@ pip install -r requirements.txt
 ```
 
 ### 3. Start Execution
-```
+
+#### 3.1 Direct execution
+```bash
 python -m interactive-bot
 ```
 
-**Note:** For formal operation, it's recommended to use process management tools like `PM2`, `supervisor`, etc., along with watchdogs to achieve uninterrupted operation, automatic restart, and failure recovery.
+**Note:** For production, use a process manager like `PM2` or `supervisor` for auto-restart and uninterrupted operation.
+
+#### 3.2 Docker execution
+
+1. Install Docker — see [Install Docker under Ubuntu 22.04](https://gist.github.com/dehsilvadeveloper/c3bdf0f4cdcc5c177e2fe9be671820c7)
+2. Copy `.env_example` to `.env` and fill in your configuration
+3. Start the service:
+
+```bash
+docker compose up -d --build
+```
+
+**Data persistence:** The database (`assets/db.sqlite3`) and session state (`assets/*.pickle`) are mounted from the host `./assets` directory, so data survives container rebuilds.
+
+```bash
+# View logs
+docker compose logs -f
+
+# Stop service
+docker compose down
+
+# Rebuild and restart after code updates
+docker compose up -d --build
+```
 
 # ToDoList
 - [x] Support message reply functionality. Messages can reference each other.

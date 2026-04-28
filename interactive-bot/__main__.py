@@ -1,3 +1,4 @@
+import asyncio
 import os
 import random
 import time
@@ -7,7 +8,7 @@ from string import ascii_letters as letters
 import httpx
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -123,18 +124,19 @@ async def send_contact_card(
     chat_id, message_thread_id, user: User, update: Update, context: ContextTypes
 ):
     buttons = []
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                f"{'🏆 高级会员' if user.is_premium else '✈️ 普通会员' }",
-                url=f"https://github.com/MiHaKun/Telegram-interactive-bot",
-            )
-        ]
-    )
     if user.username:
         buttons.append(
             [InlineKeyboardButton("👤 直接联络", url=f"https://t.me/{user.username}")]
         )
+
+    membership = "🏆 Premium" if user.is_premium else "✈️ 普通"
+    caption = (
+        f"👤 {mention_html(user.id, user.first_name)}\n\n"
+        f"📱 {user.id}\n\n"
+        f"🔗 @{user.username if user.username else '无'}\n\n"
+        f"💎 会员：{membership}"
+    )
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
 
     user_photo = await context.bot.get_user_profile_photos(user.id)
 
@@ -143,19 +145,18 @@ async def send_contact_card(
         await context.bot.send_photo(
             chat_id,
             photo=pic,
-            caption=f"👤 {mention_html(user.id, user.first_name)}\n\n📱 {user.id}\n\n🔗 @{user.username if user.username else '无'}",
+            caption=caption,
             message_thread_id=message_thread_id,
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=reply_markup,
             parse_mode="HTML",
         )
     else:
-        await context.bot.send_contact(
+        await context.bot.send_message(
             chat_id,
-            phone_number="11111",
-            first_name=user.first_name,
-            last_name=user.last_name,
+            text=caption,
             message_thread_id=message_thread_id,
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=reply_markup,
+            parse_mode="HTML",
         )
 
 
@@ -485,22 +486,59 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _broadcast(context: ContextTypes.DEFAULT_TYPE):
+    msg_id, source_chat_id, status_chat_id, status_msg_id = context.job.data
     users = db.query(User).all()
-    msg_id, chat_id = context.job.data.split("_")
+    total = len(users)
     success = 0
     failed = 0
-    for u in users:
+    last_edit_at = 0.0
+
+    async def _update_status(final=False):
+        nonlocal last_edit_at
+        now = time.time()
+        if not final and now - last_edit_at < 3:
+            return
+        done = success + failed
+        bar = "█" * (done * 10 // total) + "░" * (10 - done * 10 // total) if total else "░" * 10
+        text = (
+            f"{'📢 广播完成！' if final else '📢 广播进行中...'}\n\n"
+            f"{bar} {done}/{total}\n"
+            f"✅ 成功：{success}　❌ 失败：{failed}"
+        )
         try:
-            chat = await context.bot.get_chat(u.user_id)
-            await chat.send_copy(chat_id, msg_id)
-            success += 1
-        except Exception as e:
+            await context.bot.edit_message_text(
+                chat_id=status_chat_id,
+                message_id=status_msg_id,
+                text=text,
+            )
+            last_edit_at = now
+        except Exception:
+            pass
+
+    for u in users:
+        sent = False
+        for attempt in range(2):
+            try:
+                chat = await context.bot.get_chat(u.user_id)
+                await chat.send_copy(source_chat_id, msg_id)
+                success += 1
+                sent = True
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except Exception:
+                break
+        if not sent and attempt == 1:
             failed += 1
+        await _update_status()
+        await asyncio.sleep(0.05)  # 限速 ~20 条/秒，低于 Telegram 30/s 上限
+
+    await _update_status(final=True)
 
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not user.id in admin_user_ids:
+    if user.id not in admin_user_ids:
         await update.message.reply_html("你没有权限执行此操作。")
         return
 
@@ -510,10 +548,19 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    total = db.query(User).count()
+    status_msg = await update.message.reply_html(
+        f"📢 广播准备中...\n\n░░░░░░░░░░ 0/{total}\n✅ 成功：0　❌ 失败：0"
+    )
     context.job_queue.run_once(
         _broadcast,
         0,
-        data=f"{update.message.reply_to_message.id}_{update.effective_chat.id}",
+        data=(
+            update.message.reply_to_message.id,
+            update.effective_chat.id,
+            update.effective_chat.id,
+            status_msg.message_id,
+        ),
     )
 
 

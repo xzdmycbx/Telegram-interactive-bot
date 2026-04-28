@@ -69,9 +69,27 @@ python -m interactive-bot
 **PS:** 正式运营，还是需要类似`PM2`、`supervisor`之类的进程管理工具，配合看门狗来实现不间断运行、自动重启、失效重启等功能。 
 
 #### 3.2 docker 执行
-1. 安装docker ， 参看 [Install Docker under Ubuntu 22.04](https://gist.github.com/dehsilvadeveloper/c3bdf0f4cdcc5c177e2fe9be671820c7)
-2. 执行`docker build -t tgibot .` 生成一个tgibot的镜像
-3. 执行`docker run --restart always --name telegram-interactive-bot  -v "$PWD":/app tgibot:latest` 生成容器并执行。
+
+1. 安装 Docker，参看 [Install Docker under Ubuntu 22.04](https://gist.github.com/dehsilvadeveloper/c3bdf0f4cdcc5c177e2fe9be671820c7)
+2. 复制 `.env_example` 为 `.env` 并填写配置（见步骤一）
+3. 启动服务：
+
+```bash
+docker compose up -d --build
+```
+
+**数据持久化说明：** 数据库（`assets/db.sqlite3`）和会话状态（`assets/*.pickle`）均挂载到宿主机的 `./assets` 目录，容器重建后数据不丢失。
+
+```bash
+# 查看日志
+docker compose logs -f
+
+# 停止服务
+docker compose down
+
+# 重新构建并启动（更新代码后）
+docker compose up -d --build
+```
 
 # ToDoList
 - [x] 准备完善下，docker化
