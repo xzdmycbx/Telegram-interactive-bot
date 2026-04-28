@@ -110,6 +110,8 @@ async def send_media_group_later(
 
 
 def update_user_db(user: telegram.User):
+    if user.is_bot:
+        return
     if db.query(User).filter(User.user_id == user.id).first():
         return
     u = User(
@@ -161,7 +163,8 @@ async def send_contact_card(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    update_user_db(user)
+    if user.id not in admin_user_ids:
+        update_user_db(user)
     if user.id in admin_user_ids:
         logger.info(f"{user.first_name}({user.id}) is admin")
         try:
@@ -218,7 +221,7 @@ async def check_human(update: Update, context: ContextTypes.DEFAULT_TYPE):
         button_matrix = [buttons[i : i + 4] for i in range(0, len(buttons), 4)]
         sent = await update.message.reply_photo(
             photo,
-            f"{mention_html(user.id, user.first_name)}请选择图片中的文字。回答错误将无法联系客服。",
+            f"{mention_html(user.id, user.first_name)}请选择图片中的文字。回答错误将无法联系管理员。",
             reply_markup=InlineKeyboardMarkup(button_matrix),
             parse_mode="HTML",
         )
@@ -276,7 +279,7 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
     ):
         if f.status == "closed":
             await update.message.reply_html(
-                "客服已经关闭对话。如需联系，请利用其他途径联络客服回复和你的对话。"
+                "管理员已经结束对话,请联系管理员重新打开对话"
             )
             return
     if not message_thread_id:
@@ -351,14 +354,14 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
     except BadRequest as e:
         if is_delete_topic_as_ban_forever:
             await update.message.reply_html(
-                f"发送失败，你的对话已经被客服删除。请联系客服重新打开对话。"
+                f"发送失败，你的对话已经被管理员删除。请联系管理员重新打开对话。"
             )
         else:
             u.message_thread_id = 0
             db.add(u)
             db.commit()
             await update.message.reply_html(
-                f"发送失败，你的对话已经被客服删除。请再发送一条消息用来激活对话。"
+                f"发送失败，你的对话已经被管理员删除。请再发送一条消息用来激活对话。"
             )
     except Exception as e:
         await update.message.reply_html(
@@ -367,7 +370,6 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    update_user_db(update.effective_user)
     message_thread_id = update.message.message_thread_id
     if not message_thread_id:
         # general message, ignore
@@ -387,7 +389,7 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
         return
     if update.message.forum_topic_closed:
         await context.bot.send_message(
-            user_id, "对话已经结束。对方已经关闭了对话。你的留言将被忽略。"
+            user_id, "管理员关闭了与您的对话,接下来您的留言将不会被转发给管理员,请知悉"
         )
         if (
             f := db.query(FormnStatus)
@@ -399,7 +401,7 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
             db.commit()
         return
     if update.message.forum_topic_reopened:
-        await context.bot.send_message(user_id, "对方重新打开了对话。可以继续对话了。")
+        await context.bot.send_message(user_id, "管理员重新打开了与您的对话,现在您发送的消息将会转发给管理员")
         if (
             f := db.query(FormnStatus)
             .filter(FormnStatus.message_thread_id == update.message.message_thread_id)
@@ -416,14 +418,14 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
     ):
         if f.status == "closed":
             await update.message.reply_html(
-                "对话已经结束。希望和对方联系，需要打开对话。"
+                "请重新打开对话以和对方联系"
             )
             return
     chat_id = user_id
     # 构筑下发送参数
     params = {}
     if update.message.reply_to_message:
-        # 群组中，客服回复了一条消息。我们需要找到这条消息在用户中的id
+        # 群组中，管理员回复了一条消息。我们需要找到这条消息在用户中的id
         reply_in_admin = update.message.reply_to_message.message_id
         if (
             msg_map := db.query(MessageMap)
@@ -505,7 +507,7 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _broadcast(context: ContextTypes.DEFAULT_TYPE):
     msg_id, source_chat_id, status_chat_id, status_msg_id = context.job.data
-    users = db.query(User).all()
+    users = db.query(User).filter(User.user_id != context.bot.id).all()
     total = len(users)
     success = 0
     failed = 0
@@ -546,7 +548,7 @@ async def _broadcast(context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(e.retry_after + 1)
             except Exception:
                 break
-        if not sent and attempt == 1:
+        if not sent:
             failed += 1
         await _update_status()
         await asyncio.sleep(0.05)  # 限速 ~20 条/秒，低于 Telegram 30/s 上限
