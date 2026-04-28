@@ -172,6 +172,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️⚠️后台管理群组设置错误，请检查配置。⚠️⚠️\n你需要确保已经将机器人 @{context.bot.username} 邀请入管理群组并且给与了管理员权限。\n错误细节：{e}\n"
             )
             return ConversationHandler.END
+        context.user_data["is_human"] = True
         await update.message.reply_html(
             f"你好管理员 {mention_html(user.id, user.first_name)}，配置正确，后台群组：<b>{bg.title}</b>\n\n"
             f"<b>可用指令：</b>\n\n"
