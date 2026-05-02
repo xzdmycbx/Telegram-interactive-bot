@@ -38,7 +38,7 @@ from . import (
     message_interval,
     general_topic_id,
 )
-from .utils import delete_message_later
+from .utils import delete_message_later, has_traditional_chinese, to_simplified
 
 # 创建表（使用的sqlite，是无法轻易alter表的。如果改动，需要删除重建。无法merge）
 Base.metadata.create_all(bind=engine)
@@ -78,6 +78,16 @@ async def _send_media_group_later(context: ContextTypes.DEFAULT_TYPE):
             )
             db.add(msg_map)
             db.commit()
+            if msg.caption_html and has_traditional_chinese(msg.caption_html):
+                try:
+                    await context.bot.edit_message_caption(
+                        chat_id=target_id,
+                        message_id=sent.message_id,
+                        caption=to_simplified(msg.caption_html),
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    logger.error(f"convert media group caption failed: {e}")
     else:
         # 发送给用户
         sents = await chat.send_copies(
@@ -107,6 +117,33 @@ async def send_media_group_later(
         _send_media_group_later, delay, chat_id=chat_id, name=name, data=media_group_id
     )
     return name
+
+
+# 将转发到管理员侧的消息中的繁体中文改写为简体（不影响管理员→用户方向）
+async def convert_to_simplified_in_admin(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id,
+    sent_message_id,
+    text_html,
+    caption_html,
+):
+    try:
+        if text_html and has_traditional_chinese(text_html):
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=sent_message_id,
+                text=to_simplified(text_html),
+                parse_mode="HTML",
+            )
+        elif caption_html and has_traditional_chinese(caption_html):
+            await context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=sent_message_id,
+                caption=to_simplified(caption_html),
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        logger.error(f"convert to simplified failed: {e}")
 
 
 def update_user_db(user: telegram.User):
@@ -351,6 +388,13 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
         db.add(msg_map)
         db.commit()
 
+        await convert_to_simplified_in_admin(
+            context,
+            chat_id,
+            sent_msg.message_id,
+            update.message.text_html,
+            update.message.caption_html,
+        )
     except BadRequest as e:
         if is_delete_topic_as_ban_forever:
             await update.message.reply_html(
@@ -591,6 +635,81 @@ async def error_in_send_media_group(update: Update, context: ContextTypes.DEFAUL
     return ConversationHandler.END
 
 
+async def edited_message_u2a(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    edited_msg = update.edited_message
+    if not edited_msg:
+        return
+    user = update.effective_user
+    if user.id in admin_user_ids:
+        return
+
+    msg_map = (
+        db.query(MessageMap)
+        .filter(
+            MessageMap.user_chat_message_id == edited_msg.message_id,
+            MessageMap.user_id == user.id,
+        )
+        .first()
+    )
+    if not msg_map:
+        return
+
+    u = db.query(User).filter(User.user_id == user.id).first()
+    if not u or not u.message_thread_id:
+        return
+
+    new_html = edited_msg.text_html or edited_msg.caption_html or ""
+    if not new_html.strip():
+        return
+    new_html = to_simplified(new_html)
+
+    notice = f"✏️ 用户编辑了这条消息为：\n\n{new_html}"
+    try:
+        await context.bot.send_message(
+            chat_id=admin_group_id,
+            text=notice,
+            message_thread_id=u.message_thread_id,
+            reply_to_message_id=msg_map.group_chat_message_id,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"notify edit u2a failed: {e}")
+
+
+async def edited_message_a2u(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    edited_msg = update.edited_message
+    if not edited_msg:
+        return
+    if not edited_msg.message_thread_id:
+        return
+
+    msg_map = (
+        db.query(MessageMap)
+        .filter(MessageMap.group_chat_message_id == edited_msg.message_id)
+        .first()
+    )
+    if not msg_map:
+        return
+
+    try:
+        if edited_msg.text is not None:
+            await context.bot.edit_message_text(
+                chat_id=msg_map.user_id,
+                message_id=msg_map.user_chat_message_id,
+                text=edited_msg.text_html,
+                parse_mode="HTML",
+            )
+        elif edited_msg.caption is not None:
+            await context.bot.edit_message_caption(
+                chat_id=msg_map.user_id,
+                message_id=msg_map.user_chat_message_id,
+                caption=edited_msg.caption_html,
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        logger.error(f"sync edit a2u failed: {e}")
+
+
 async def forwarding_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reaction = update.message_reaction
     if not reaction:
@@ -659,12 +778,30 @@ if __name__ == "__main__":
 
     application.add_handler(
         MessageHandler(
-            ~filters.COMMAND & filters.ChatType.PRIVATE, forwarding_message_u2a
+            filters.UpdateType.MESSAGE
+            & ~filters.COMMAND
+            & filters.ChatType.PRIVATE,
+            forwarding_message_u2a,
         )
     )
     application.add_handler(
         MessageHandler(
-            ~filters.COMMAND & filters.Chat([admin_group_id]), forwarding_message_a2u
+            filters.UpdateType.MESSAGE
+            & ~filters.COMMAND
+            & filters.Chat([admin_group_id]),
+            forwarding_message_a2u,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.UpdateType.EDITED_MESSAGE & filters.ChatType.PRIVATE,
+            edited_message_u2a,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.UpdateType.EDITED_MESSAGE & filters.Chat([admin_group_id]),
+            edited_message_a2u,
         )
     )
     application.add_handler(

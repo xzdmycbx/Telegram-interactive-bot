@@ -28,3 +28,4 @@ typing_extensions==4.12.2
 tzdata==2024.1
 tzlocal==5.2
 python-dotenv==1.0.1
+zhconv==1.4.3

@@ -4,8 +4,21 @@ import random
 from string import ascii_letters as letters
 
 import pytz
+import zhconv
 from telegram import ChatMember, ChatMemberUpdated
 from telegram.ext import ContextTypes
+
+
+def to_simplified(text):
+    if not text:
+        return text
+    return zhconv.convert(text, "zh-cn")
+
+
+def has_traditional_chinese(text):
+    if not text:
+        return False
+    return zhconv.convert(text, "zh-cn") != text
 
 
 async def _delete_message_cb(context: ContextTypes.DEFAULT_TYPE):
