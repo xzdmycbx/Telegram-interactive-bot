@@ -20,6 +20,7 @@ from telegram.ext import (
     PicklePersistence,
     filters,
 )
+from telegram.request import HTTPXRequest
 from telegram.helpers import mention_html
 
 from db.database import SessionMaker, engine
@@ -767,9 +768,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 if __name__ == "__main__":
     pickle_persistence = PicklePersistence(filepath=f"./assets/{app_name}.pickle")
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0)
     application = (
         ApplicationBuilder()
         .token(bot_token)
+        .request(request)
         .persistence(persistence=pickle_persistence)
         .build()
     )
@@ -815,4 +818,16 @@ if __name__ == "__main__":
     )
     application.add_handler(MessageReactionHandler(forwarding_reaction))
     application.add_error_handler(error_handler)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Retry startup on transient ConnectTimeout errors (e.g. network not ready at container start)
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
+            break
+        except telegram.error.TimedOut as e:
+            if attempt == max_retries:
+                raise
+            wait = 2 ** attempt
+            logger.warning(f"连接超时，{wait}s 后重试 (第 {attempt}/{max_retries} 次)... 错误: {e}")
+            time.sleep(wait)
