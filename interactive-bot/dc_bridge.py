@@ -28,6 +28,7 @@ from telegram.error import BadRequest
 from db.model import BridgeState, DiscordMessageMap, DiscordOutbox, DiscordThread, MessageMap, User
 
 from . import admin_group_id, general_topic_id
+from .dc_avatar import AvatarProvider
 from .dc_common import (
     NO_MENTIONS,
     WEBHOOK_NAME,
@@ -147,6 +148,10 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
         notify_channel_id=0,
         admin_role_ids=(),
         proxy=None,
+        bot_token="",
+        avatar_public_url=None,
+        avatar_port=8080,
+        avatar_dir="./assets/avatars",
     ):
         self.db = db
         self.token = token
@@ -159,6 +164,10 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
         self.history = None  # TgHistory，可选
         self.on_clear = None  # async (user_id)，由主程序提供，Discord 的 /clear 使用
         self.history_cutoff = 0
+        self.avatars = None  # AvatarProvider，start() 时创建
+        self._avatar_conf = dict(
+            bot_token=bot_token, public_url=avatar_public_url, port=avatar_port, directory=avatar_dir
+        )
 
         intents = discord.Intents.none()
         intents.guilds = True
@@ -199,6 +208,13 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
     async def start(self, bot):
         self.bot = bot
         self.http = aiohttp.ClientSession()
+        self.avatars = AvatarProvider(bot=bot, http=self.http, proxy=self.proxy, **self._avatar_conf)
+        if self.avatars.public_url:
+            try:
+                await self.avatars.start_server()
+            except OSError as e:
+                logger.error(f"头像服务启动失败（端口 {self.avatars.port}）：{e}，改用公开头像链接")
+                self.avatars.public_url = None
         await self._ensure_history_cutoff()
         # 先于任何实时任务入队，保证同一用户的补发在新消息之前
         self._replay_outbox()
@@ -213,6 +229,8 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
         await self.runner.close()
         if not self.client.is_closed():
             await self.client.close()
+        if self.avatars:
+            await self.avatars.close()
         if self.http:
             await self.http.close()
         if self.mtproto:
@@ -327,6 +345,21 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
                 return None
 
         return self.runner.submit(user_id, job, what)
+
+    # ---------- 头像 ----------
+
+    async def _avatar(self, user_id, username=None, *, admin=False):
+        if not self.avatars:
+            return None
+        return await self.avatars.url_for(user_id, username, admin=admin)
+
+    def _bot_avatar(self):
+        avatar = getattr(self.client.user, "display_avatar", None)
+        return str(avatar.url) if avatar else None
+
+    def _db_username(self, user_id):
+        u = self.db.query(User).filter(User.user_id == user_id).first()
+        return u.username if u else None
 
     # ---------- outbox：持久化待办 ----------
 

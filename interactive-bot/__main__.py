@@ -44,6 +44,8 @@ from . import (
     tg_api_id,
     tg_api_hash,
     proxy_url,
+    avatar_public_url,
+    avatar_port,
 )
 from .utils import (
     delete_message_later,
@@ -68,6 +70,10 @@ if discord_bot_token:
         notify_channel_id=discord_notify_channel_id,
         admin_role_ids=discord_admin_role_ids,
         proxy=proxy_url,
+        bot_token=bot_token,
+        avatar_public_url=avatar_public_url,
+        avatar_port=avatar_port,
+        avatar_dir="./assets/avatars",
     )
     if tg_api_id and tg_api_hash:
         from .dc_history import TgHistory

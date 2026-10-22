@@ -7,6 +7,9 @@ services:
     env_file: .env
     volumes:
       - ./assets:/app/assets
+    # 配置了 AVATAR_PUBLIC_URL（Discord 头像服务）时取消注释，端口与 AVATAR_PORT 一致
+    # ports:
+    #   - "8080:8080"
     extra_hosts:
       # 容器内可通过 host.docker.internal 访问宿主机上的代理
       - "host.docker.internal:host-gateway"

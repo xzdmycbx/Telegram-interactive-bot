@@ -47,8 +47,11 @@ try:
         int(x.strip()) for x in os.getenv("DISCORD_ADMIN_ROLE_IDS", "").split(",") if x.strip()
     ]
     tg_api_id = int(os.getenv("TG_API_ID", "").strip() or 0)
+    avatar_port = int(os.getenv("AVATAR_PORT", "").strip() or 8080)
 except ValueError:
-    exit("DISCORD_FORUM_CHANNEL_ID / DISCORD_NOTIFY_CHANNEL_ID / DISCORD_ADMIN_ROLE_IDS / TG_API_ID 应该是数字")
+    exit("DISCORD_FORUM_CHANNEL_ID / DISCORD_NOTIFY_CHANNEL_ID / DISCORD_ADMIN_ROLE_IDS / TG_API_ID / AVATAR_PORT 应该是数字")
+# Discord 消息头像：公网能访问到本程序头像服务的地址（可选），例如 https://bot.example.com
+avatar_public_url = os.getenv("AVATAR_PUBLIC_URL", "").strip() or None
 tg_api_hash = os.getenv("TG_API_HASH", "").strip()
 if discord_bot_token and not discord_forum_channel_id:
     exit("启用 Discord 同步时 DISCORD_FORUM_CHANNEL_ID 必须填写")

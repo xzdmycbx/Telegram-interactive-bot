@@ -83,7 +83,7 @@ class TgToDiscordMixin:
             kwargs["files"] = [u.to_file() for u in uploads]
         return await thread.send(**kwargs)
 
-    async def _webhook_send(self, thread_id, *, content, uploads, username):
+    async def _webhook_send(self, thread_id, *, content, uploads, username, avatar_url=None):
         self._check_alive()
         uploads = list(uploads)
         for _ in range(4):
@@ -94,6 +94,8 @@ class TgToDiscordMixin:
                 wait=True,
                 allowed_mentions=NO_MENTIONS,
             )
+            if avatar_url:
+                kwargs["avatar_url"] = avatar_url
             if content:
                 kwargs["content"] = content
             if uploads:
@@ -257,16 +259,17 @@ class TgToDiscordMixin:
         while len(self._snippets) > 5000:
             self._snippets.popitem(last=False)
 
-    async def _post(self, user_id, thread_id, out, *, username, prefix=(), origin, pairs):
+    async def _post(self, user_id, thread_id, out, *, username, prefix=(), origin, pairs, avatar_url=None):
         """发送 OutMessage。带文件时受全局并发限制，临时文件保留到上传完成"""
+        args = (username, prefix, origin, pairs, avatar_url)
         if not out.files:
-            return await self._post_prepared(user_id, thread_id, out, [], [], username, prefix, origin, pairs)
+            return await self._post_prepared(user_id, thread_id, out, [], [], *args)
         async with self.media_sem:
             with tempfile.TemporaryDirectory(prefix="dcbridge-") as workdir:
                 uploads, notes = await self._prepare_files(out.files, workdir)
-                return await self._post_prepared(user_id, thread_id, out, uploads, notes, username, prefix, origin, pairs)
+                return await self._post_prepared(user_id, thread_id, out, uploads, notes, *args)
 
-    async def _post_prepared(self, user_id, thread_id, out, uploads, notes, username, prefix, origin, pairs):
+    async def _post_prepared(self, user_id, thread_id, out, uploads, notes, username, prefix, origin, pairs, avatar_url):
         """每发出一条 Discord 消息立刻写映射；全部发完把 DiscordPost.stage 标记为完成"""
         header_lines = list(prefix)
         if out.forward_from:
@@ -328,10 +331,14 @@ class TgToDiscordMixin:
 
         for idx, part in enumerate(parts):
             files = groups.pop(0) if idx == len(parts) - 1 and groups else []
-            message = await self._webhook_send(thread_id, content=part, uploads=files, username=username)
+            message = await self._webhook_send(
+                thread_id, content=part, uploads=files, username=username, avatar_url=avatar_url
+            )
             record(message, files, idx)
         for files in groups:
-            message = await self._webhook_send(thread_id, content=None, uploads=files, username=username)
+            message = await self._webhook_send(
+                thread_id, content=None, uploads=files, username=username, avatar_url=avatar_url
+            )
             record(message, files, None)
         if post is not None:
             post.stage = STAGE_DONE
@@ -350,7 +357,24 @@ class TgToDiscordMixin:
             return await self._post(user_id, thread_id, out, **kwargs)
 
     async def _system_post(self, user_id, text):
-        await self._post_recover(user_id, OutMessage(bodies={0: text}), username="🤖 系统", origin="system", pairs=[])
+        await self._post_recover(
+            user_id,
+            OutMessage(bodies={0: text}),
+            username="🤖 系统",
+            origin="system",
+            pairs=[],
+            avatar_url=self._bot_avatar(),
+        )
+
+    async def _tg_avatar_for(self, user_id, origin, message=None, tg_user=None):
+        """用户消息用用户头像；TG 管理员回复用该管理员的头像；匿名管理员用默认头像"""
+        if origin == "user":
+            username = tg_user.username if tg_user else self._db_username(user_id)
+            return await self._avatar(user_id, username)
+        sender = message.from_user if (message is not None and not message.sender_chat) else None
+        if sender is None:
+            return await self._avatar(None, admin=True)
+        return await self._avatar(sender.id, sender.username, admin=True)
 
     def _tg_sync_state(self, group_message_ids):
         """这些 TG 消息的同步状态：None 未同步，"done" 已完成，"partial" 上次只发了一部分"""
@@ -635,6 +659,7 @@ class TgToDiscordMixin:
                 prefix=prefix,
                 origin=origin,
                 pairs=pairs,
+                avatar_url=await self._tg_avatar_for(user_id, origin, messages[0], tg_user),
             )
 
         self._submit_outbox(user_id, outbox_id, job, f"tg→dc {origin}")
@@ -668,6 +693,7 @@ class TgToDiscordMixin:
                 prefix=[f"-# ✏️ 用户编辑了[这条消息]({jump})，新内容："],
                 origin="system",
                 pairs=[],
+                avatar_url=await self._tg_avatar_for(user_id, "user"),
             )
 
         self._submit(user_id, job, "tg→dc user edit")
@@ -683,13 +709,14 @@ class TgToDiscordMixin:
                 body = tg_to_discord(message.text, ents_from_ptb(message.entities))
             else:
                 body = tg_to_discord(message.caption or "", ents_from_ptb(message.caption_entities))
-            if not await self._apply_admin_edit(message.message_id, body):
+            avatar_url = await self._tg_avatar_for(user_id, "tg_admin", message)
+            if not await self._apply_admin_edit(message.message_id, body, avatar_url):
                 if self._album_pending(message):
                     self._retry_edit_later(self.mirror_admin_edit, user_id, message, _retries)
 
         self._submit_outbox(user_id, outbox_id, job, "tg→dc admin edit")
 
-    async def _apply_admin_edit(self, group_msg_id, body):
+    async def _apply_admin_edit(self, group_msg_id, body, avatar_url=None):
         """更新某条 TG 消息在帖子里的正文并重建；找不到映射返回 False"""
         item = (
             self.db.query(DiscordMessageMap)
@@ -704,10 +731,10 @@ class TgToDiscordMixin:
             return False
         item.body = body
         self._commit()
-        await self._rebuild_post(item.post_id)
+        await self._rebuild_post(item.post_id, avatar_url)
         return True
 
-    async def _rebuild_post(self, post_id):
+    async def _rebuild_post(self, post_id, avatar_url=None):
         """按当前各成员的正文重建帖子文字：编辑已有分段，多出的新发，少了的删除（带附件的只清空文字）。
         每一步都立即提交，并在结束时把保留下来的分段重新编号为 0..n-1"""
         post = self.db.get(DiscordPost, post_id)
@@ -759,7 +786,9 @@ class TgToDiscordMixin:
                 self._commit()
         # 带附件但被清空文字的分段保留在原位置；新增的分段只能追加在后面
         for k in range(min(len(texts), len(parts)), len(parts)):
-            message = await self._webhook_send(thread_id, content=parts[k], uploads=[], username=post.username)
+            message = await self._webhook_send(
+                thread_id, content=parts[k], uploads=[], username=post.username, avatar_url=avatar_url
+            )
             row = DiscordMessageMap(
                 user_id=first.user_id,
                 user_chat_message_id=first.user_chat_message_id,

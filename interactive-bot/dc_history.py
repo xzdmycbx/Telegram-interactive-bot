@@ -216,7 +216,7 @@ class TgHistory:
         return out
 
     def _label(self, m, user_name):
-        """返回 (webhook 昵称, origin)"""
+        """返回 (webhook 昵称, 发送者类型 user / system / tg_admin)"""
         if m.sender_id == self.mtproto.bot_id:
             if m.id in self._group_to_user_msg:
                 return sanitize_webhook_name(user_name), "user"
@@ -226,6 +226,15 @@ class TgHistory:
         else:
             name = (utils.get_display_name(m.sender) if m.sender else "") or "管理员"
         return sanitize_webhook_name(f"🛡️ {name} · TG"), "tg_admin"
+
+    async def _avatar_for(self, m, kind, user_id):
+        if kind == "user":
+            return await self.bridge._avatar(user_id, self.bridge._db_username(user_id))
+        if kind == "system":
+            return self.bridge._bot_avatar()
+        if m.post or m.sender_id == self.mtproto.group_id or not m.sender:
+            return await self.bridge._avatar(None, admin=True)
+        return await self.bridge._avatar(m.sender_id, getattr(m.sender, "username", None), admin=True)
 
     # ---------- 单用户迁移 ----------
 
@@ -289,7 +298,7 @@ class TgHistory:
             return
         if sync == "partial":
             await self.bridge._discard_partial_tg(ids)
-        label, detected = self._label(first, user_name)
+        label, kind = self._label(first, user_name)
         prefix = []
         if label != state["label"] or ts - state["ts"] > TIME_GAP:
             prefix.append(f"-# 🕒 <t:{ts}:f>")
@@ -302,7 +311,13 @@ class TgHistory:
         if pairs is None:
             pairs = [(self._group_to_user_msg.get(m.id), m.id) for m in unit]
         await self.bridge._post_recover(
-            user_id, out, username=label, prefix=prefix, origin=origin or "history", pairs=pairs
+            user_id,
+            out,
+            username=label,
+            prefix=prefix,
+            origin=origin or "history",
+            pairs=pairs,
+            avatar_url=await self._avatar_for(first, kind, user_id),
         )
         state.update(label=label, ts=ts, count=state["count"] + len(unit))
 
@@ -325,7 +340,10 @@ class TgHistory:
         (m,) = await self.mtproto.get_messages([group_msg_id])
         if m is None:
             return
-        await self.bridge._apply_admin_edit(group_msg_id, tg_to_discord(m.message or "", ents_from_telethon(m.entities)))
+        avatar = await self._avatar_for(m, "tg_admin", user_id)
+        await self.bridge._apply_admin_edit(
+            group_msg_id, tg_to_discord(m.message or "", ents_from_telethon(m.entities)), avatar
+        )
 
     # ---------- /dc_migrate ----------
 
