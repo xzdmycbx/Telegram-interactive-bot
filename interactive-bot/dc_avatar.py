@@ -9,6 +9,7 @@ Telegram 头像没有这样的公开地址（Bot API 的下载链接含机器人
 3. 都拿不到：用 Discord 自带的默认头像（用户、TG 管理员两种颜色区分）。
 """
 
+import asyncio
 import glob
 import hashlib
 import hmac
@@ -26,7 +27,10 @@ from .dc_common import logger
 DEFAULT_USER = "https://cdn.discordapp.com/embed/avatars/0.png"
 DEFAULT_ADMIN = "https://cdn.discordapp.com/embed/avatars/2.png"
 DEFAULT_DISCORD = "https://cdn.discordapp.com/embed/avatars/1.png"
-CACHE_TTL = 12 * 3600
+# 查到的结果缓存 2 小时：用户换头像后，最多 2 小时新消息就会用上新头像
+CACHE_TTL = 2 * 3600
+# 查询出错（网络等）只缓存 10 分钟，稍后重试
+RETRY_TTL = 10 * 60
 KEEP_VERSIONS = 3
 
 _OG_IMAGE = re.compile(r'<meta\s+property="og:image"\s+content="([^"]+)"')
@@ -44,6 +48,7 @@ class AvatarProvider:
         self.directory = directory
         self._secret = hashlib.sha256(b"avatar:" + bot_token.encode()).digest()
         self._cache = OrderedDict()  # user_id -> (url 或 None, 过期时间)
+        self._inflight = {}  # user_id -> 进行中的查询
         self._runner = None
 
     # ---------- 对外 ----------
@@ -56,19 +61,41 @@ class AvatarProvider:
         cached = self._cache.get(user_id)
         if cached and cached[1] > time.time():
             return cached[0] or default
-        url = None
+        # 同一用户的并发查询合并成一次
+        task = self._inflight.get(user_id)
+        if task is None:
+            task = asyncio.ensure_future(self._resolve(user_id, username))
+            self._inflight[user_id] = task
+            task.add_done_callback(lambda t: self._inflight.pop(user_id, None))
+        return await asyncio.shield(task) or default
+
+    async def _resolve(self, user_id, username):
+        url, reason, ttl = None, None, CACHE_TTL
         try:
             if self.public_url:
                 url = await self._self_hosted(user_id)
-            if url is None and username:
-                url = await self._public_link(username)
+                reason = "Telegram 上看不到该用户的头像"
+            if url is None:
+                # 数据库里的用户名只在第一次私聊时记录，可能为空或已过时，优先用当前的
+                ok, current = await self._current_username(user_id)
+                if ok:
+                    username = current  # 查询成功但没有用户名：不能退回旧用户名（可能已被别人注册）
+                else:
+                    ttl = RETRY_TTL  # 查不到当前用户名，先用已知的，稍后再确认
+                if not username:
+                    reason = reason or "没有公开用户名（配置 AVATAR_PUBLIC_URL 后可显示）"
+                else:
+                    url = await self._public_link(username)
+                    reason = reason or f"@{username} 的头像没有对所有人公开（配置 AVATAR_PUBLIC_URL 后可显示）"
         except Exception as e:
-            logger.info(f"获取头像失败 {user_id}: {e}")
-        self._cache[user_id] = (url, time.time() + CACHE_TTL)
+            reason, ttl = f"获取失败，{RETRY_TTL // 60} 分钟后重试：{e}", RETRY_TTL
+        if url is None:
+            logger.info(f"用户 {user_id} 使用默认头像：{reason}")
+        self._cache[user_id] = (url, time.time() + ttl)
         self._cache.move_to_end(user_id)
         while len(self._cache) > 5000:
             self._cache.popitem(last=False)
-        return url or default
+        return url
 
     # ---------- 自建服务 ----------
 
@@ -137,9 +164,20 @@ class AvatarProvider:
 
     # ---------- t.me 公开头像 ----------
 
+    async def _current_username(self, user_id):
+        """返回 (是否查询成功, 当前用户名)"""
+        try:
+            chat = await self.bot.get_chat(user_id)
+        except Exception as e:
+            logger.debug(f"获取用户 {user_id} 的当前用户名失败：{e}")
+            return False, None
+        return True, getattr(chat, "username", None)
+
     async def _public_link(self, username):
         timeout = aiohttp.ClientTimeout(total=10)
         async with self.http.get(f"https://t.me/{username}", proxy=self.proxy, timeout=timeout) as resp:
+            if resp.status == 429 or resp.status >= 500:
+                raise RuntimeError(f"t.me 返回 {resp.status}")  # 暂时性错误，按短缓存重试
             if resp.status != 200:
                 return None
             text = await resp.text()
