@@ -162,3 +162,5 @@ cython_debug/
 #.idea/
 
 .env
+# Telethon 会话文件（历史迁移）
+assets/*.session*

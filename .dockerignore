@@ -1,0 +1,13 @@
+.git
+.idea
+.vscode
+.env
+venv
+.venv
+__pycache__
+*.py[cod]
+log.txt
+doc
+assets/*.sqlite3*
+assets/*.pickle
+assets/*.session*

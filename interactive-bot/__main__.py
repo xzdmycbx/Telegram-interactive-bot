@@ -37,12 +37,52 @@ from . import (
     disable_captcha,
     message_interval,
     general_topic_id,
+    discord_bot_token,
+    discord_forum_channel_id,
+    discord_notify_channel_id,
+    discord_admin_role_ids,
+    tg_api_id,
+    tg_api_hash,
+    proxy_url,
 )
-from .utils import delete_message_later, has_traditional_chinese, to_simplified
+from .utils import (
+    delete_message_later,
+    has_traditional_chinese,
+    set_topic_status,
+    to_simplified,
+)
 
 # 创建表（使用的sqlite，是无法轻易alter表的。如果改动，需要删除重建。无法merge）
 Base.metadata.create_all(bind=engine)
 db = SessionMaker()
+
+# Discord 同步（可选）
+bridge = None
+if discord_bot_token:
+    from .dc_bridge import DiscordBridge
+
+    bridge = DiscordBridge(
+        db,
+        token=discord_bot_token,
+        forum_channel_id=discord_forum_channel_id,
+        notify_channel_id=discord_notify_channel_id,
+        admin_role_ids=discord_admin_role_ids,
+        proxy=proxy_url,
+    )
+    if tg_api_id and tg_api_hash:
+        from .dc_history import TgHistory
+        from .dc_mtproto import MtprotoClient
+
+        # MTProto：历史迁移、超过 Bot API 限制的大文件收发
+        bridge.mtproto = MtprotoClient(
+            api_id=tg_api_id,
+            api_hash=tg_api_hash,
+            bot_token=bot_token,
+            session=f"./assets/{app_name}-mtproto",
+            group_id=admin_group_id,
+            proxy=proxy_url,
+        )
+        bridge.history = TgHistory(bridge, bridge.mtproto)
 
 
 # 延时发送媒体组消息的回调
@@ -61,6 +101,7 @@ async def _send_media_group_later(context: ContextTypes.DEFAULT_TYPE):
         .all()
     )
     chat = await context.bot.get_chat(target_id)
+    album = bridge.pop_album(from_chat_id, media_group_id) if bridge else []
     if dir == "u2a":
         # 发送给群组
         u = db.query(User).filter(User.user_id == from_chat_id).first()
@@ -70,6 +111,13 @@ async def _send_media_group_later(context: ContextTypes.DEFAULT_TYPE):
             [m.message_id for m in media_group_msgs],
             message_thread_id=message_thread_id,
         )
+        if bridge:
+            bridge.mirror_tg_messages(
+                u.user_id,
+                album,
+                origin="user",
+                pairs=[(msg.message_id, sent.message_id) for sent, msg in zip(sents, media_group_msgs)],
+            )
         for sent, msg in zip(sents, media_group_msgs):
             msg_map = MessageMap(
                 user_chat_message_id=msg.message_id,
@@ -101,6 +149,13 @@ async def _send_media_group_later(context: ContextTypes.DEFAULT_TYPE):
             )
             db.add(msg_map)
             db.commit()
+        if bridge:
+            bridge.mirror_tg_messages(
+                int(target_id),
+                album,
+                origin="tg_admin",
+                pairs=[(sent.message_id, msg.message_id) for sent, msg in zip(sents, media_group_msgs)],
+            )
 
 
 # 延时发送媒体组消息
@@ -221,6 +276,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"▸ <code>/start</code>\n  检测机器人配置是否正确\n\n"
             f"▸ <code>/clear</code>（在话题内执行）\n  删除当前话题，可选同步清除用户侧消息\n\n"
             f"▸ <code>/broadcast</code>（回复一条消息后执行）\n  将被回复的消息广播给所有用户"
+            + (
+                "\n\n▸ <code>/dc_migrate</code>（在 General 或用户话题内执行）\n  把历史消息迁移到 Discord"
+                if bridge
+                else ""
+            )
         )
     else:
         await update.message.reply_html(
@@ -367,6 +427,8 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
             )
             db.add(msg)
             db.commit()
+            if bridge:
+                bridge.stash_album_part(update.message)
             if update.message.media_group_id != context.user_data.get(
                 "current_media_group_id", 0
             ):
@@ -390,6 +452,14 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
         )
         db.add(msg_map)
         db.commit()
+        if bridge:
+            bridge.mirror_tg_messages(
+                user.id,
+                [update.message],
+                origin="user",
+                pairs=[(update.message.id, sent_msg.message_id)],
+                tg_user=user,
+            )
 
         await convert_to_simplified_in_admin(
             context,
@@ -428,35 +498,24 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
         logger.debug(update.message)
         return
     if update.message.forum_topic_created:
-        f = FormnStatus(
-            message_thread_id=update.message.message_thread_id, status="opened"
-        )
-        db.add(f)
-        db.commit()
+        set_topic_status(db, message_thread_id, "opened")
         return
-    if update.message.forum_topic_closed:
-        await context.bot.send_message(
-            user_id, "管理员关闭了与您的对话,接下来您的留言将不会被转发给管理员,请知悉"
-        )
-        if (
-            f := db.query(FormnStatus)
-            .filter(FormnStatus.message_thread_id == update.message.message_thread_id)
-            .first()
-        ):
-            f.status = "closed"
-            db.add(f)
-            db.commit()
-        return
-    if update.message.forum_topic_reopened:
-        await context.bot.send_message(user_id, "管理员重新打开了与您的对话,现在您发送的消息将会转发给管理员")
-        if (
-            f := db.query(FormnStatus)
-            .filter(FormnStatus.message_thread_id == update.message.message_thread_id)
-            .first()
-        ):
-            f.status = "opened"
-            db.add(f)
-            db.commit()
+    if update.message.forum_topic_closed or update.message.forum_topic_reopened:
+        closed = bool(update.message.forum_topic_closed)
+        # 状态没变说明是从 Discord 同步过来的，那边已经通知过用户
+        changed = set_topic_status(db, message_thread_id, "closed" if closed else "opened")
+        if bridge:
+            bridge.reconcile_lock(user_id)
+        if changed:
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    "管理员关闭了与您的对话,接下来您的留言将不会被转发给管理员,请知悉"
+                    if closed
+                    else "管理员重新打开了与您的对话,现在您发送的消息将会转发给管理员",
+                )
+            except Exception as e:
+                logger.info(f"通知用户对话状态失败：{e}")
         return
     if (
         f := db.query(FormnStatus)
@@ -491,6 +550,8 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
             )
             db.add(msg)
             db.commit()
+            if bridge:
+                bridge.stash_album_part(update.message)
             if update.message.media_group_id != context.application.user_data[
                 user_id
             ].get("current_media_group_id", 0):
@@ -518,6 +579,13 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
         )
         db.add(msg_map)
         db.commit()
+        if bridge:
+            bridge.mirror_tg_messages(
+                user_id,
+                [update.message],
+                origin="tg_admin",
+                pairs=[(sent_msg.message_id, update.message.id)],
+            )
 
     except Exception as e:
         await update.message.reply_html(
@@ -525,31 +593,45 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
         )
 
 
+async def clear_conversation(bot, target_user: User):
+    """删除用户的会话：TG 话题、Discord 帖子，以及（按配置）用户侧的消息。TG 与 Discord 的 /clear 共用"""
+    if bridge:
+        # 先作废该用户还没执行完的同步任务，避免清除后旧任务继续发消息
+        bridge.delete_user_thread(target_user.user_id)
+    if target_user.message_thread_id:
+        try:
+            await bot.delete_forum_topic(admin_group_id, target_user.message_thread_id)
+        except BadRequest as e:
+            logger.info(f"删除话题失败（可能已被删除）：{e}")
+    target_user.message_thread_id = 0
+    db.add(target_user)
+    db.commit()
+    if is_delete_user_messages:
+        all_messages_in_user_chat = (
+            db.query(MessageMap).filter(MessageMap.user_id == target_user.user_id).all()
+        )
+        message_ids = [msg.user_chat_message_id for msg in all_messages_in_user_chat]
+        # deleteMessages 一次最多 100 条
+        for i in range(0, len(message_ids), 100):
+            await bot.delete_messages(target_user.user_id, message_ids[i : i + 100])
+
+
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user.id in admin_user_ids:
         await update.message.reply_html("你没有权限执行此操作。")
         return
-    await context.bot.delete_forum_topic(
-        update.effective_chat.id, update.message.message_thread_id
-    )
     target_user = (
         db.query(User)
         .filter(User.message_thread_id == update.message.message_thread_id)
         .first()
     )
     if target_user:
-        target_user.message_thread_id = 0
-        db.add(target_user)
-        db.commit()
-        if is_delete_user_messages:
-            all_messages_in_user_chat = (
-                db.query(MessageMap).filter(MessageMap.user_id == target_user.user_id).all()
-            )
-            await context.bot.delete_messages(
-                target_user.user_id,
-                [msg.user_chat_message_id for msg in all_messages_in_user_chat],
-            )
+        await clear_conversation(context.bot, target_user)
+    else:
+        await context.bot.delete_forum_topic(
+            update.effective_chat.id, update.message.message_thread_id
+        )
 
 
 async def _broadcast(context: ContextTypes.DEFAULT_TYPE):
@@ -645,6 +727,8 @@ async def edited_message_u2a(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.effective_user
     if user.id in admin_user_ids:
         return
+    if bridge:
+        bridge.mirror_user_edit(user.id, edited_msg)
 
     msg_map = (
         db.query(MessageMap)
@@ -693,6 +777,8 @@ async def edited_message_a2u(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     if not msg_map:
         return
+    if bridge:
+        bridge.mirror_admin_edit(msg_map.user_id, edited_msg)
 
     try:
         if edited_msg.text is not None:
@@ -731,6 +817,13 @@ async def forwarding_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         if not msg_map:
             return
+        if bridge:
+            bridge.mirror_tg_reaction(
+                msg_map.user_id,
+                group_msg_id=message_id,
+                old=reaction.old_reaction,
+                new=reaction.new_reaction,
+            )
         try:
             await context.bot.set_message_reaction(
                 chat_id=msg_map.user_id,
@@ -751,6 +844,13 @@ async def forwarding_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         if not msg_map:
             return
+        if bridge:
+            bridge.mirror_tg_reaction(
+                chat_id,
+                user_msg_id=message_id,
+                old=reaction.old_reaction,
+                new=reaction.new_reaction,
+            )
         try:
             await context.bot.set_message_reaction(
                 chat_id=admin_group_id,
@@ -759,6 +859,45 @@ async def forwarding_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         except Exception:
             pass
+
+
+async def dc_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in admin_user_ids:
+        await update.message.reply_html("你没有权限执行此操作。")
+        return
+    if not bridge:
+        await update.message.reply_html("未启用 Discord 同步（DISCORD_BOT_TOKEN 未填写）。")
+        return
+    # 在用户话题内执行：只迁移该用户；在 General 执行：迁移全部
+    only_user_id = None
+    thread_id = update.message.message_thread_id if update.message.is_topic_message else None
+    if thread_id and thread_id != general_topic_id:
+        target = db.query(User).filter(User.message_thread_id == thread_id).first()
+        if not target:
+            await update.message.reply_html("当前话题没有对应的用户。")
+            return
+        only_user_id = target.user_id
+    status = await update.message.reply_html("⏳ 准备迁移历史消息到 Discord…")
+    if error := bridge.start_migration(status.chat_id, status.message_id, only_user_id):
+        await status.edit_text(f"❌ {error}")
+
+
+async def post_init(application):
+    if bridge:
+
+        async def clear_from_discord(user_id):
+            target_user = db.query(User).filter(User.user_id == user_id).first()
+            if target_user:
+                await clear_conversation(application.bot, target_user)
+
+        bridge.on_clear = clear_from_discord
+        await bridge.start(application.bot)
+
+
+async def post_stop(application):
+    if bridge:
+        await bridge.close()
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -774,6 +913,8 @@ if __name__ == "__main__":
         ApplicationBuilder()
         .token(bot_token)
         .persistence(persistence=pickle_persistence)
+        .post_init(post_init)
+        .post_stop(post_stop)
         .build()
     )
 
@@ -812,6 +953,9 @@ if __name__ == "__main__":
     )
     application.add_handler(
         CommandHandler("broadcast", broadcast, filters.Chat([admin_group_id]))
+    )
+    application.add_handler(
+        CommandHandler("dc_migrate", dc_migrate, filters.Chat([admin_group_id]))
     )
     application.add_handler(
         CallbackQueryHandler(callback_query_vcode, pattern="^vcode_")

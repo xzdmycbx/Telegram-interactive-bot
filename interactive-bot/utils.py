@@ -8,6 +8,8 @@ import zhconv
 from telegram import ChatMember, ChatMemberUpdated
 from telegram.ext import ContextTypes
 
+from db.model import FormnStatus
+
 
 def to_simplified(text):
     if not text:
@@ -49,6 +51,31 @@ async def ban_user_later(delay: float, chat_id, user_id: int, time, context: Con
     name=f"banjob_{chat_id}_{user_id}"
     context.job_queue.run_once(_ban_user_cb, delay, chat_id=chat_id, name=name , data=f"{user_id}-{time}")
     return name
+
+def get_topic_status(db, message_thread_id):
+    f = (
+        db.query(FormnStatus)
+        .filter(FormnStatus.message_thread_id == message_thread_id)
+        .first()
+    )
+    return f.status if f else "opened"
+
+
+def set_topic_status(db, message_thread_id, status):
+    """更新话题状态，没有记录时新建。返回状态是否发生了变化"""
+    f = (
+        db.query(FormnStatus)
+        .filter(FormnStatus.message_thread_id == message_thread_id)
+        .first()
+    )
+    old = f.status if f else "opened"
+    if not f:
+        f = FormnStatus(message_thread_id=message_thread_id)
+    f.status = status
+    db.add(f)
+    db.commit()
+    return old != status
+
 
 def remove_job_if_exists(name: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Remove job with given name. Returns whether job was removed."""

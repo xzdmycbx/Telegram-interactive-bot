@@ -94,7 +94,25 @@ docker compose down
 docker compose up -d --build
 ```
 
+Docker is also the recommended way to run locally. If you need a proxy, add `HTTPS_PROXY=http://host.docker.internal:<port>` to `.env` (Discord only supports HTTP proxies).
+
+## 4. Mirror to Discord (optional)
+
+When enabled, every private chat appears **both** in the Telegram admin group and in a Discord server; admins on either side can reply and see each other's replies.
+
+- Each user gets a post in a Discord **forum channel** (the first message is a profile card). User / Telegram admin messages are posted through a webhook under their names; anything an admin says in the post is sent to the user and mirrored into the Telegram topic.
+- Closing / reopening a topic ⇄ locking / unlocking the post (three-way reconciliation, no flip-flopping). `/clear` works on both sides (a Discord slash command inside the post). Edits, reactions and deletions of Discord-originated messages are synced.
+- Formatting, mentions, media, albums, locations, polls, forwards (including Discord forwards / embeds) and replies are converted. Animated (.tgs) and video (.webm) stickers are rendered to **GIF**; Discord APNG / Lottie stickers become GIFs on Telegram.
+- Large files: with MTProto configured, files over the Bot API limits are downloaded / uploaded via MTProto (up to 2GB); videos over Discord's upload limit are compressed with ffmpeg; anything that still cannot be synced gets a note with a link to the original Telegram message.
+- Queued sync jobs are persisted and replayed after a restart or crash, without duplicates.
+
+Setup:
+1. Create a Discord application/bot, enable **Message Content Intent**, invite it (scopes `bot` + `applications.commands`) with permissions: View Channels, Send Messages, Send Messages in Threads, Create Public Threads, Manage Threads, Manage Webhooks, Attach Files, Embed Links, Read Message History, Add Reactions.
+2. Create a forum channel (do not require tags) and fill `DISCORD_BOT_TOKEN`, `DISCORD_FORUM_CHANNEL_ID` (optional: `DISCORD_NOTIFY_CHANNEL_ID`, `DISCORD_ADMIN_ROLE_IDS`).
+3. Recommended: fill `TG_API_ID` / `TG_API_HASH` from <https://my.telegram.org> (needed for history migration, large files and replaying TG messages after a restart). The bot reads the admin group history via MTProto **as itself** (no user login). A user's history is migrated automatically when their post is first created; send `/dc_migrate` in General to migrate everyone (or inside a topic for that user only). Migration is resumable and never duplicates live messages.
+
 # ToDoList
+- [x] Mirror conversations to Discord (with history migration).
 - [x] Support message reply functionality. Messages can reference each other.
 - [x] Improve the database.
 - [x] Add client's human-machine recognition to prevent bored individuals from using userbots to spam.
