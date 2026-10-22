@@ -646,6 +646,9 @@ class TgToDiscordMixin:
                 await self._discard_partial_tg(group_ids)
             announce = origin == "user" and self._is_new_conversation(user_id)
             await self._ensure_thread(user_id, tg_user=tg_user, announce=announce)
+            # 新建帖子时可能刚迁移过历史，其中可能已包含这几条
+            if self._tg_sync_state(group_ids) == "done":
+                return
             out = self.out_from_ptb(messages, origin=origin, pairs=pairs)
             if origin == "user":
                 out.bodies = {k: to_simplified(v) for k, v in out.bodies.items()}

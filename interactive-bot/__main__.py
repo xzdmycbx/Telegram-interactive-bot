@@ -284,6 +284,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"▸ <code>/broadcast</code>（回复一条消息后执行）\n  将被回复的消息广播给所有用户"
             + (
                 "\n\n▸ <code>/dc_migrate</code>（在 General 或用户话题内执行）\n  把历史消息迁移到 Discord"
+                "\n\n▸ <code>/dc_reset confirm</code>\n  清空 Discord 侧并把全部消息重新迁移"
                 if bridge
                 else ""
             )
@@ -889,6 +890,29 @@ async def dc_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"❌ {error}")
 
 
+async def dc_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in admin_user_ids:
+        await update.message.reply_html("你没有权限执行此操作。")
+        return
+    if not bridge:
+        await update.message.reply_html("未启用 Discord 同步（DISCORD_BOT_TOKEN 未填写）。")
+        return
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.message.reply_html(
+            "⚠️ <b>重置 Discord 同步并重新迁移</b>\n\n"
+            "会做这些事：\n"
+            "1. 删除 Discord 论坛里机器人创建的所有帖子；\n"
+            "2. 清空 Discord 侧的同步记录（Telegram 这边的用户、话题、消息记录都不受影响）；\n"
+            "3. 把到现在为止的全部消息当作历史，重新迁移到 Discord。\n\n"
+            "确认请发送：<code>/dc_reset confirm</code>"
+        )
+        return
+    status = await update.message.reply_html("⏳ 正在重置 Discord 同步…")
+    if error := bridge.start_reset(status.chat_id, status.message_id):
+        await status.edit_text(f"❌ {error}")
+
+
 async def post_init(application):
     if bridge:
 
@@ -962,6 +986,9 @@ if __name__ == "__main__":
     )
     application.add_handler(
         CommandHandler("dc_migrate", dc_migrate, filters.Chat([admin_group_id]))
+    )
+    application.add_handler(
+        CommandHandler("dc_reset", dc_reset, filters.Chat([admin_group_id]))
     )
     application.add_handler(
         CallbackQueryHandler(callback_query_vcode, pattern="^vcode_")
