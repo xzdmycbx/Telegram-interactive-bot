@@ -9,6 +9,7 @@
 - 关闭/锁定状态用「三方对账」：记录上次两边一致的状态，哪边变了就以哪边为准同步另一边；
   事件只是触发对账的信号，执行时读取两边的当前状态。启动时会主动对账一次，失败会退避重试。
 - /clear 会让该用户的会话「代次」加一，之前入队、还没执行完的任务全部作废。
+- webhook 发送经过全局令牌桶匀速发出，尽量不触发 Discord 的限流。
 """
 
 import asyncio
@@ -27,7 +28,15 @@ from telegram.error import BadRequest
 from db.model import BridgeState, DiscordMessageMap, DiscordOutbox, DiscordThread, MessageMap, User
 
 from . import admin_group_id, general_topic_id
-from .dc_common import NO_MENTIONS, WEBHOOK_NAME, ConversationCleared, ThreadGone, is_transient, logger
+from .dc_common import (
+    NO_MENTIONS,
+    WEBHOOK_NAME,
+    ConversationCleared,
+    RatePacer,
+    ThreadGone,
+    is_transient,
+    logger,
+)
 from .dc_dc2tg import DiscordToTgMixin
 from .dc_format import escape_md
 from .dc_tg2dc import TgToDiscordMixin
@@ -40,6 +49,9 @@ INLINE_RETRY_DELAYS = (5, 15, 45)  # 暂时性失败在队列里的重试间隔�
 MAX_OUTBOX_ATTEMPTS = 20  # 超过后放弃
 OUTBOX_RETRY_INTERVAL = 600  # 定时补发间隔（秒）
 MEDIA_CONCURRENCY = 2  # 同时进行的下载/转码/上传数
+# webhook 发送节奏：平均每分钟约 28 条，允许 5 条突发（Discord 同频道约 30 条/分钟）
+WEBHOOK_RATE = 28 / 60
+WEBHOOK_BURST = 5
 
 
 class _SerialRunner:
@@ -169,6 +181,7 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
         self.failed = False
         self.runner = _SerialRunner(on_error=self._rollback)
         self.media_sem = asyncio.Semaphore(MEDIA_CONCURRENCY)
+        self.webhook_pacer = RatePacer(WEBHOOK_RATE, WEBHOOK_BURST)
         self._client_task = None
         self._migration_task = None
         self._background = set()

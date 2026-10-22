@@ -87,6 +87,7 @@ class TgToDiscordMixin:
         self._check_alive()
         uploads = list(uploads)
         for _ in range(4):
+            await self.webhook_pacer.wait()
             kwargs = dict(
                 username=username,
                 thread=discord.Object(id=thread_id),

@@ -52,6 +52,32 @@ def tg_message_link(group_message_id):
     return f"https://t.me/c/{internal}/{group_message_id}"
 
 
+class RatePacer:
+    """令牌桶：平均每秒 rate 个，允许 burst 个的短时突发。
+    Discord 对同一频道的 webhook 消息有约 30 条/分钟的限制，且不体现在响应头里，
+    discord.py 只能撞上 429 再等待；这里主动匀速发送，尽量不触发限流"""
+
+    def __init__(self, rate, burst):
+        self.rate = rate
+        self.capacity = burst
+        self.tokens = float(burst)
+        self.updated = None
+        self._lock = asyncio.Lock()
+
+    async def wait(self):
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            while True:
+                now = loop.time()
+                if self.updated is not None:
+                    self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                await asyncio.sleep((1 - self.tokens) / self.rate)
+
+
 class ThreadGone(Exception):
     """Discord 帖子已被删除"""
 
