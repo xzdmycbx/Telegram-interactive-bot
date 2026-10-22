@@ -341,14 +341,25 @@ class DiscordToTgMixin:
         for row in rows:
             for chat_id, mid in ((user_id, row.user_chat_message_id), (admin_group_id, row.group_chat_message_id)):
                 if mid:
-                    with contextlib.suppress(Exception):
-                        await self.bot.delete_message(chat_id, mid)
+                    await self._delete_tg_message(chat_id, mid)
             self.db.query(MessageMap).filter(
                 MessageMap.user_id == user_id, MessageMap.user_chat_message_id == row.user_chat_message_id
             ).delete(synchronize_session="fetch")
             self.db.delete(row)
         self.db.delete(post)
         self._commit()
+
+    async def _delete_tg_message(self, chat_id, message_id):
+        """删除成功或消息已不存在则返回；暂时性错误抛出，保留映射稍后重试"""
+        try:
+            await self.bot.delete_message(chat_id, message_id)
+        except BadRequest as e:
+            if "not found" not in str(e).lower():
+                logger.warning(f"撤回 Telegram 消息失败（可能超过 48 小时），保留原消息：{e}")
+        except Exception as e:
+            if is_transient(e):
+                raise
+            logger.warning(f"撤回 Telegram 消息失败：{e}")
 
     async def _dc_to_tg(self, user_id, message):
         post = self._dc_post(message.id)
@@ -495,11 +506,13 @@ class DiscordToTgMixin:
             )
             pending = [r for r in rows if not r.group_chat_message_id]
             if pending:
+                self._check_alive()
                 header = _header(post.username or "Discord")
                 await self._tg_retry(
                     lambda: self.bot.send_message(admin_group_id, header[0], parse_mode=ParseMode.HTML, message_thread_id=tg_thread)
                 )
             for row in pending:
+                self._check_alive()
                 copied = await self._tg_retry(
                     lambda: self.bot.copy_message(admin_group_id, user_id, row.user_chat_message_id, message_thread_id=tg_thread)
                 )
@@ -779,10 +792,15 @@ class DiscordToTgMixin:
         tg_thread = u.message_thread_id if u else 0
         first = texts[0]
         for k, (h, p) in enumerate(chunks):
+            self._check_alive()
             if k < len(texts):
                 row = texts[k]
                 await self._edit_tg_text(user_id, row.user_chat_message_id, "text", h, p, None)
-                await self._edit_tg_text(admin_group_id, row.group_chat_message_id, "text", h, p, header if k == 0 else None)
+                if row.group_chat_message_id:
+                    await self._edit_tg_text(admin_group_id, row.group_chat_message_id, "text", h, p, header if k == 0 else None)
+                elif tg_thread and first.group_chat_message_id:
+                    # 上次追加时后台那条没发成功：补发
+                    await self._send_segment_to_group(row, h, p, first, tg_thread)
                 continue
             user_msg = await self._with_parse_fallback(
                 lambda v, pm: self.bot.send_message(
@@ -791,38 +809,42 @@ class DiscordToTgMixin:
                 ),
                 h, p,
             )
-            group_mid = None
-            if tg_thread and first.group_chat_message_id:
-                group_msg = await self._with_parse_fallback(
-                    lambda v, pm: self.bot.send_message(
-                        admin_group_id, v, parse_mode=pm, message_thread_id=tg_thread,
-                        reply_parameters=ReplyParameters(message_id=first.group_chat_message_id, allow_sending_without_reply=True),
-                    ),
-                    h, p,
-                )
-                group_mid = group_msg.message_id
-            self.db.add(MessageMap(user_chat_message_id=user_msg.message_id, group_chat_message_id=group_mid, user_id=user_id))
-            self.db.add(
-                DiscordMessageMap(
-                    user_id=user_id,
-                    user_chat_message_id=user_msg.message_id,
-                    group_chat_message_id=group_mid,
-                    discord_message_id=first.discord_message_id,
-                    discord_thread_id=first.discord_thread_id,
-                    part=k,
-                    origin="dc_admin",
-                    text_role="text",
-                    post_id=first.post_id,
-                )
+            # 用户那边发出后立刻记账，后台失败重试时不会再给用户重复发
+            row = DiscordMessageMap(
+                user_id=user_id,
+                user_chat_message_id=user_msg.message_id,
+                discord_message_id=first.discord_message_id,
+                discord_thread_id=first.discord_thread_id,
+                part=k,
+                origin="dc_admin",
+                text_role="text",
+                post_id=first.post_id,
             )
+            self.db.add(MessageMap(user_chat_message_id=user_msg.message_id, group_chat_message_id=None, user_id=user_id))
+            self.db.add(row)
             self._commit()
+            if tg_thread and first.group_chat_message_id:
+                await self._send_segment_to_group(row, h, p, first, tg_thread)
         for row in texts[len(chunks):]:
             for chat_id, mid in ((user_id, row.user_chat_message_id), (admin_group_id, row.group_chat_message_id)):
                 if mid:
-                    with contextlib.suppress(Exception):
-                        await self.bot.delete_message(chat_id, mid)
+                    await self._delete_tg_message(chat_id, mid)
             self.db.delete(row)
             self._commit()
+
+    async def _send_segment_to_group(self, row, h, p, first, tg_thread):
+        group_msg = await self._with_parse_fallback(
+            lambda v, pm: self.bot.send_message(
+                admin_group_id, v, parse_mode=pm, message_thread_id=tg_thread,
+                reply_parameters=ReplyParameters(message_id=first.group_chat_message_id, allow_sending_without_reply=True),
+            ),
+            h, p,
+        )
+        row.group_chat_message_id = group_msg.message_id
+        self.db.query(MessageMap).filter(
+            MessageMap.user_id == row.user_id, MessageMap.user_chat_message_id == row.user_chat_message_id
+        ).update({MessageMap.group_chat_message_id: group_msg.message_id}, synchronize_session="fetch")
+        self._commit()
 
     async def _edit_tg_text(self, chat_id, message_id, role, html_text, plain, header):
         """html_text 为 None 时按纯文本编辑"""
@@ -860,30 +882,40 @@ class DiscordToTgMixin:
         await self._edit_tg_text(admin_group_id, row.group_chat_message_id, "caption", "", "", header)
         u = self.db.query(User).filter(User.user_id == user_id).first()
         tg_thread = u.message_thread_id if u else 0
-        user_msg = await self._send_tg(user_id, html_text, plain, [], reply_to=row.user_chat_message_id)
-        group_msg = []
-        if tg_thread and row.group_chat_message_id:
-            group_msg = await self._send_tg(
-                admin_group_id, html_text, plain, [], reply_to=row.group_chat_message_id, thread_id=tg_thread, header=header
-            )
+        # 说明已清空，原媒体不再承载文字；新文字的分段每发出一条立刻记账
         row.text_role = None
-        for k, (_, umsg) in enumerate(user_msg):
-            gmid = group_msg[k][1].message_id if k < len(group_msg) else None
-            self.db.add(MessageMap(user_chat_message_id=umsg.message_id, group_chat_message_id=gmid, user_id=user_id))
-            self.db.add(
-                DiscordMessageMap(
-                    user_id=user_id,
-                    user_chat_message_id=umsg.message_id,
-                    group_chat_message_id=gmid,
-                    discord_message_id=row.discord_message_id,
-                    discord_thread_id=row.discord_thread_id,
-                    part=k,
-                    origin="dc_admin",
-                    text_role="text",
-                    post_id=row.post_id,
-                )
-            )
         self._commit()
+        new_rows = {}
+
+        def on_user(role, msg):
+            part = int(role.split(":")[1]) if ":" in str(role) else 0
+            new = DiscordMessageMap(
+                user_id=user_id,
+                user_chat_message_id=msg.message_id,
+                discord_message_id=row.discord_message_id,
+                discord_thread_id=row.discord_thread_id,
+                part=part,
+                origin="dc_admin",
+                text_role="text",
+                post_id=row.post_id,
+            )
+            mm = MessageMap(user_chat_message_id=msg.message_id, group_chat_message_id=None, user_id=user_id)
+            self.db.add_all([new, mm])
+            self._commit()
+            new_rows[role] = (new, mm)
+
+        def on_group(role, msg):
+            if role in new_rows:
+                new, mm = new_rows[role]
+                new.group_chat_message_id = mm.group_chat_message_id = msg.message_id
+                self._commit()
+
+        await self._send_tg(user_id, html_text, plain, [], reply_to=row.user_chat_message_id, on_sent=on_user)
+        if tg_thread and row.group_chat_message_id:
+            await self._send_tg(
+                admin_group_id, html_text, plain, [], reply_to=row.group_chat_message_id, thread_id=tg_thread,
+                header=header, on_sent=on_group,
+            )
 
     async def _on_raw_message_delete(self, payload):
         user_id = self._user_by_thread(payload.channel_id)

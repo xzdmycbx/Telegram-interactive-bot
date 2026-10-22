@@ -88,6 +88,7 @@ class TgToDiscordMixin:
         uploads = list(uploads)
         for _ in range(4):
             await self.webhook_pacer.wait()
+            self._check_alive()  # 等待期间会话可能已被 /clear 或 /dc_reset 作废
             kwargs = dict(
                 username=username,
                 thread=discord.Object(id=thread_id),
@@ -124,6 +125,7 @@ class TgToDiscordMixin:
 
     async def _edit_dc_message(self, thread_id, message_id, content, username):
         """编辑 webhook 发出的消息；锁帖时由机器人代发的消息走机器人编辑。content 为 None 表示清空文字"""
+        self._check_alive()
         try:
             await self.webhook.edit_message(
                 message_id, content=content, thread=discord.Object(id=thread_id), allowed_mentions=NO_MENTIONS
@@ -139,16 +141,24 @@ class TgToDiscordMixin:
         text = "\n".join(x for x in (f"-# 💬 {escape_md(username)}", content) if x)
         await message.edit(content=text, allowed_mentions=NO_MENTIONS)
 
-    async def _delete_dc_message(self, thread_id, message_id):
+    async def _delete_dc_message(self, thread_id, message_id, strict=False):
+        """strict：只有「已删除 / 不存在」才算成功，暂时性错误抛出让上层稍后重试"""
         try:
             await self.webhook.delete_message(message_id, thread=discord.Object(id=thread_id))
-        except discord.HTTPException:
-            try:
-                await self.client.get_partial_messageable(thread_id).get_partial_message(message_id).delete()
-            except discord.NotFound:
-                pass
-            except discord.HTTPException as e:
-                logger.info(f"删除 Discord 消息失败 {message_id}: {e}")
+            return
+        except discord.NotFound:
+            return
+        except discord.HTTPException as e:
+            if strict and is_transient(e):
+                raise
+        try:
+            await self.client.get_partial_messageable(thread_id).get_partial_message(message_id).delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            if strict and is_transient(e):
+                raise
+            logger.warning(f"删除 Discord 消息失败 {message_id}: {e}")
 
     # ---------- 文件准备 ----------
 
@@ -388,6 +398,9 @@ class TgToDiscordMixin:
         )
         if not rows:
             return None
+        # 每一条都有映射、且所属的同步都已完成，才算完成；只有一部分有映射也按「发了一半」处理
+        if {r.group_chat_message_id for r in rows} != set(ids):
+            return "partial"
         post_ids = {r.post_id for r in rows if r.post_id}
         if not post_ids:
             return "done"
@@ -406,11 +419,12 @@ class TgToDiscordMixin:
             .all()
         )
         post_ids = {r.post_id for r in rows if r.post_id}
-        posts = self.db.query(DiscordPost).filter(DiscordPost.id.in_(post_ids), DiscordPost.stage < STAGE_DONE).all()
+        posts = self.db.query(DiscordPost).filter(DiscordPost.id.in_(post_ids)).all()
         for post in posts:
             rows = self.db.query(DiscordMessageMap).filter(DiscordMessageMap.post_id == post.id).all()
+            # 删除失败（暂时性错误）时直接抛出，保留映射，稍后重试，避免留下没人跟踪的旧副本
             for thread_id, message_id in {(r.discord_thread_id, r.discord_message_id) for r in rows}:
-                await self._delete_dc_message(thread_id, message_id)
+                await self._delete_dc_message(thread_id, message_id, strict=True)
             for r in rows:
                 self.db.delete(r)
             self.db.delete(post)
@@ -671,35 +685,42 @@ class TgToDiscordMixin:
         """用户编辑了消息：和 TG 后台一样，以回复的形式贴出新内容（保留原文）"""
         if not self.active:
             return
+        if message.text is not None:
+            body = tg_to_discord(message.text, ents_from_ptb(message.entities))
+        else:
+            body = tg_to_discord(message.caption or "", ents_from_ptb(message.caption_entities))
+        body = to_simplified(body)
+        if not body.strip():
+            return
+        payload = {"user_msg_id": message.message_id, "body": body}
+        outbox_id = None if _retries else self._outbox_add(user_id, "tg_user_edit", payload)
 
         async def job():
-            row = self._dmm_first(
-                DiscordMessageMap.user_id == user_id,
-                DiscordMessageMap.user_chat_message_id == message.message_id,
-            )
-            if not row:
+            if not await self._post_user_edit(user_id, message.message_id, body):
                 if self._album_pending(message):
                     self._retry_edit_later(self.mirror_user_edit, user_id, message, _retries)
-                return
-            if message.text is not None:
-                body = tg_to_discord(message.text, ents_from_ptb(message.entities))
-            else:
-                body = tg_to_discord(message.caption or "", ents_from_ptb(message.caption_entities))
-            body = to_simplified(body)
-            if not body.strip():
-                return
-            jump = self._jump_url(row.discord_thread_id, row.discord_message_id)
-            await self._post_recover(
-                user_id,
-                OutMessage(bodies={0: body}),
-                username=self._label(user_id, "user"),
-                prefix=[f"-# ✏️ 用户编辑了[这条消息]({jump})，新内容："],
-                origin="system",
-                pairs=[],
-                avatar_url=await self._tg_avatar_for(user_id, "user"),
-            )
 
-        self._submit(user_id, job, "tg→dc user edit")
+        self._submit_outbox(user_id, outbox_id, job, "tg→dc user edit")
+
+    async def _post_user_edit(self, user_id, user_msg_id, body):
+        """贴出用户编辑后的内容；原消息还没同步过返回 False"""
+        row = self._dmm_first(
+            DiscordMessageMap.user_id == user_id,
+            DiscordMessageMap.user_chat_message_id == user_msg_id,
+        )
+        if not row:
+            return False
+        jump = self._jump_url(row.discord_thread_id, row.discord_message_id)
+        await self._post_recover(
+            user_id,
+            OutMessage(bodies={0: body}),
+            username=self._label(user_id, "user"),
+            prefix=[f"-# ✏️ 用户编辑了[这条消息]({jump})，新内容："],
+            origin="system",
+            pairs=[],
+            avatar_url=await self._tg_avatar_for(user_id, "user"),
+        )
+        return True
 
     def mirror_admin_edit(self, user_id, message, _retries=0):
         """TG 管理员编辑了回复：更新该条在帖子里的正文（媒体组会重建整组正文）"""

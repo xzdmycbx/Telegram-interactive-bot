@@ -26,7 +26,15 @@ import discord
 from discord import app_commands
 from telegram.error import BadRequest
 
-from db.model import BridgeState, DiscordMessageMap, DiscordOutbox, DiscordPost, DiscordThread, MessageMap, User
+from db.model import (
+    BridgeState,
+    DiscordMessageMap,
+    DiscordOutbox,
+    DiscordPost,
+    DiscordThread,
+    MessageMap,
+    User,
+)
 
 from . import admin_group_id, general_topic_id
 from .dc_avatar import AvatarProvider
@@ -51,9 +59,10 @@ INLINE_RETRY_DELAYS = (5, 15, 45)  # 暂时性失败在队列里的重试间隔�
 MAX_OUTBOX_ATTEMPTS = 20  # 超过后放弃
 OUTBOX_RETRY_INTERVAL = 600  # 定时补发间隔（秒）
 MEDIA_CONCURRENCY = 2  # 同时进行的下载/转码/上传数
-# webhook 发送节奏：平均每分钟约 28 条，允许 5 条突发（Discord 同频道约 30 条/分钟）
-WEBHOOK_RATE = 28 / 60
+# webhook 发送节奏：平均每分钟 25 条，允许 5 条突发，任意 60 秒内最多 30 条（Discord 同频道约 30 条/分钟）
+WEBHOOK_RATE = 25 / 60
 WEBHOOK_BURST = 5
+SETUP_RETRY_INTERVAL = 300  # 初始化暂时失败后的重试间隔（秒）
 
 
 class _SerialRunner:
@@ -188,7 +197,8 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
         self.webhook: Optional[discord.Webhook] = None
         self.http: Optional[aiohttp.ClientSession] = None
         self.ready = asyncio.Event()
-        self.failed = False
+        self.failed = False  # 当前不可用：任务直接结束，持久化的待办保留
+        self._disabled = False  # 配置错误等永久性问题：不再接收新任务
         self.runner = _SerialRunner(on_error=self._rollback)
         self.media_sem = asyncio.Semaphore(MEDIA_CONCURRENCY)
         self.webhook_pacer = RatePacer(WEBHOOK_RATE, WEBHOOK_BURST)
@@ -201,7 +211,7 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
         self._snippets = OrderedDict()  # discord_message_id -> (作者, 摘要)
         self._edit_seen = OrderedDict()  # discord_message_id -> edited_timestamp
         self._reactors = OrderedDict()  # (discord_message_id, emoji) -> 添加该表情的管理员
-        self._reconcile_pending = set()
+        self._reconcile_pending = {}  # user_id -> 排队中的对账任务
         self._reconcile_failures = defaultdict(int)
         self._generation = defaultdict(int)  # user_id -> 会话代次
         self._outbox_inflight = set()
@@ -262,10 +272,16 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
     def _later(self, delay, func, *args):
         asyncio.get_running_loop().call_later(delay, func, *args)
 
-    def _fail(self, reason):
-        logger.error(f"{reason}，Discord 同步已停用")
+    def _fail(self, reason, permanent=True):
+        """permanent：配置问题，停用；否则暂时不可用，后台定期重试初始化"""
         self.failed = True
         self.ready.set()
+        if permanent:
+            self._disabled = True
+            logger.error(f"{reason}，Discord 同步已停用")
+        else:
+            logger.error(f"{reason}，{SETUP_RETRY_INTERVAL // 60} 分钟后重试；期间的同步任务会保留，恢复后补发")
+            self._spawn(self._retry_setup())
 
     async def _run_client(self):
         try:
@@ -281,33 +297,60 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
             if not self.ready.is_set():
                 self._fail("Discord 客户端无法启动")
 
+    async def _setup(self):
+        """返回 None 表示成功；否则返回 (原因, 是否永久)"""
+        try:
+            channel = self.client.get_channel(self.forum_channel_id) or await self.client.fetch_channel(
+                self.forum_channel_id
+            )
+            if not isinstance(channel, discord.ForumChannel):
+                return "DISCORD_FORUM_CHANNEL_ID 必须是一个论坛（Forum）频道", True
+            self.forum = channel
+            await self._ensure_webhook()
+        except discord.Forbidden as e:
+            return f"Discord 机器人权限不足（需要查看频道、管理 Webhook 等权限）：{e}", True
+        except discord.NotFound:
+            return f"找不到 Discord 论坛频道 {self.forum_channel_id}", True
+        except Exception as e:
+            return f"Discord 初始化失败：{e}", False
+        return None
+
     async def _on_ready(self):
         if self.ready.is_set():
             return  # 断线重连
         for attempt in range(1, 6):
-            try:
-                channel = self.client.get_channel(self.forum_channel_id) or await self.client.fetch_channel(
-                    self.forum_channel_id
-                )
-                if not isinstance(channel, discord.ForumChannel):
-                    return self._fail("DISCORD_FORUM_CHANNEL_ID 必须是一个论坛（Forum）频道")
-                self.forum = channel
-                await self._ensure_webhook()
+            error = await self._setup()
+            if error is None:
                 break
-            except discord.Forbidden as e:
-                return self._fail(f"Discord 机器人权限不足（需要查看频道、管理 Webhook 等权限）：{e}")
-            except discord.NotFound:
-                return self._fail(f"找不到 Discord 论坛频道 {self.forum_channel_id}")
-            except Exception as e:
-                logger.warning(f"Discord 初始化失败（第 {attempt} 次），稍后重试：{e}")
-                await asyncio.sleep(5 * attempt)
+            reason, permanent = error
+            if permanent:
+                return self._fail(reason)
+            logger.warning(f"{reason}（第 {attempt} 次），稍后重试")
+            await asyncio.sleep(5 * attempt)
         else:
-            return self._fail("Discord 初始化多次失败")
+            return self._fail("Discord 初始化多次失败", permanent=False)
+        await self._become_ready()
+
+    async def _become_ready(self):
         await self._setup_commands()
         logger.info(f"Discord 已连接：{self.client.user}，论坛频道：#{self.forum.name}")
+        self.failed = False
         self.ready.set()
         self._spawn(self._startup_reconcile())
         self._spawn(self._outbox_retry_loop())
+
+    async def _retry_setup(self):
+        while self.failed and not self._disabled:
+            await asyncio.sleep(SETUP_RETRY_INTERVAL)
+            error = await self._setup()
+            if error is None:
+                await self._become_ready()
+                self._replay_outbox()
+                return
+            reason, permanent = error
+            if permanent:
+                return self._fail(reason)
+            logger.warning(f"{reason}，{SETUP_RETRY_INTERVAL // 60} 分钟后再试")
 
     async def _setup_commands(self):
         guild = discord.Object(id=self.forum.guild.id)
@@ -319,7 +362,8 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
 
     @property
     def active(self):
-        return not (self.failed and self.ready.is_set())
+        """是否接收新的同步任务：只有配置错误等永久性问题才停止接收"""
+        return not self._disabled
 
     @staticmethod
     def _now():
@@ -406,9 +450,7 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
                 if self._generation[user_id] == generation:
                     await self._running.wait()
                 if self.failed:
-                    # Discord 同步不可用（配置错误等），不再保留，避免下次启动集中补发
-                    self._outbox_done(outbox_id)
-                    return None
+                    return None  # 暂时不可用：保留记录，恢复后或下次启动补发
                 _job_ctx.set((user_id, generation))
                 for attempt in range(len(INLINE_RETRY_DELAYS) + 1):
                     if self._generation[user_id] != generation:
@@ -500,6 +542,8 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
         elif kind == "tg_edit":
             if self.history:
                 await self.history.replay_admin_edit(user_id, payload["group_msg_id"])
+        elif kind == "tg_user_edit":
+            await self._post_user_edit(user_id, payload["user_msg_id"], payload["body"])
         elif kind in ("dc", "dc_edit"):
             message = await self._fetch_dc_message(payload["thread_id"], payload["message_id"])
             if message is None:
@@ -746,12 +790,16 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
 
     def reconcile_lock(self, user_id):
         """TG 话题关闭/重开、Discord 帖子锁定/解锁后调用；同一用户排队中的对账只保留一个"""
-        if not self.active or user_id in self._reconcile_pending:
+        if not self.active:
             return
-        self._reconcile_pending.add(user_id)
+        queued = self._reconcile_pending.get(user_id)
+        if queued is not None and not queued.done():
+            return
 
         async def job():
-            self._reconcile_pending.discard(user_id)
+            # 开始执行后释放标记，执行期间的新事件会再排一次对账
+            if self._reconcile_pending.get(user_id) is task:
+                del self._reconcile_pending[user_id]
             try:
                 if await self._reconcile_lock_job(user_id):
                     self._reconcile_failures.pop(user_id, None)
@@ -761,7 +809,15 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
                 logger.warning(f"对账暂时失败，稍后重试：{e}")
                 self._schedule_reconcile(user_id)
 
-        self._submit(user_id, job, "lock reconcile")
+        task = self._submit(user_id, job, "lock reconcile")
+        self._reconcile_pending[user_id] = task
+
+        def release(t):
+            # 任务被作废、跳过、取消时也释放，否则之后的对账都会被拦下
+            if self._reconcile_pending.get(user_id) is t:
+                del self._reconcile_pending[user_id]
+
+        task.add_done_callback(release)
 
     def _schedule_reconcile(self, user_id):
         n = self._reconcile_failures[user_id] = self._reconcile_failures[user_id] + 1
@@ -771,15 +827,19 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
             return
         self._later(min(600, 15 * 2**n), self.reconcile_lock, user_id)
 
-    async def _startup_reconcile(self):
+    async def _startup_reconcile(self, attempt=1):
         """启动后核对离线期间的变化：只对看起来不一致的帖子发起对账"""
         try:
             locked = {t.id: t.locked for t in self.forum.threads}
             async for t in self.forum.archived_threads(limit=None):
                 locked[t.id] = t.locked
         except Exception as e:
-            logger.warning(f"启动对账时读取帖子列表失败：{e}")
-            return
+            if attempt >= 3:
+                logger.warning(f"启动对账读取帖子列表多次失败，放弃：{e}")
+                return
+            logger.warning(f"启动对账时读取帖子列表失败，稍后重试：{e}")
+            await asyncio.sleep(60 * attempt)
+            return await self._startup_reconcile(attempt + 1)
         count = 0
         for row in self.db.query(DiscordThread).filter(DiscordThread.thread_id != 0).all():
             state = locked.get(row.thread_id)

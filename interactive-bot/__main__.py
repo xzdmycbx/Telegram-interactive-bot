@@ -782,10 +782,16 @@ async def edited_message_a2u(update: Update, context: ContextTypes.DEFAULT_TYPE)
         .filter(MessageMap.group_chat_message_id == edited_msg.message_id)
         .first()
     )
+    if bridge:
+        # 媒体组要等几秒才整组转发，此时还没有映射；按话题找到用户交给同步，它会稍后重试
+        owner = msg_map.user_id if msg_map else None
+        if owner is None and edited_msg.media_group_id:
+            u = db.query(User).filter(User.message_thread_id == edited_msg.message_thread_id).first()
+            owner = u.user_id if u else None
+        if owner:
+            bridge.mirror_admin_edit(owner, edited_msg)
     if not msg_map:
         return
-    if bridge:
-        bridge.mirror_admin_edit(msg_map.user_id, edited_msg)
 
     try:
         if edited_msg.text is not None:
