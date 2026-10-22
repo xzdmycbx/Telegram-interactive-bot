@@ -349,7 +349,10 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
         reply_in_user_chat = update.message.reply_to_message.message_id
         if (
             msg_map := db.query(MessageMap)
-            .filter(MessageMap.user_chat_message_id == reply_in_user_chat)
+            .filter(
+                MessageMap.user_chat_message_id == reply_in_user_chat,
+                MessageMap.user_id == user.id,
+            )
             .first()
         ):
             params["reply_to_message_id"] = msg_map.group_chat_message_id
