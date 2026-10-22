@@ -1033,26 +1033,48 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
         return None
 
     async def _reset(self, status_chat_id, status_message_id):
+        """先发新边界标记、再删帖，最后在同一个事务里清空记录并保存新边界；
+        中途失败时数据库保持原状，可以再次执行 /dc_reset confirm"""
+
         async def report(text):
             with contextlib.suppress(Exception):
                 await self.bot.edit_message_text(text, chat_id=status_chat_id, message_id=status_message_id)
 
         await self.ready.wait()
         if self.failed:
-            return await report("❌ Discord 同步未能启动，无法重置，请检查日志。")
+            return await report("❌ Discord 同步当前不可用，无法重置，请检查日志。")
         self._running.clear()
+        marker = None
         try:
-            # 作废所有进行中、排队中的任务（新任务暂停到重置结束），等已有的任务退出
+            # 1. 新的历史边界：这条消息之前的全部消息都按历史重新迁移
+            marker = await self.bot.send_message(
+                admin_group_id,
+                "🔄 Discord 同步重置点：在此之前的全部消息会作为历史重新迁移到 Discord。",
+                message_thread_id=general_topic_id or None,
+            )
+            # 2. 作废所有旧任务；重置期间到达的新任务暂停，等重置结束再执行
+            last_outbox = self.db.query(DiscordOutbox).order_by(DiscordOutbox.id.desc()).first()
+            old_outbox_max = last_outbox.id if last_outbox else 0
             user_ids = {r.user_id for r in self.db.query(DiscordThread).all()}
             user_ids |= {r.user_id for r in self.db.query(DiscordOutbox).all()}
             user_ids |= set(self.runner._tails)
             for uid in user_ids:
                 self._generation[uid] += 1
-            pending = list(self.runner._tasks)
-            if pending:
-                await asyncio.wait(pending, timeout=60)
+            old_tasks = list(self.runner._tasks)
+            if old_tasks:
+                _, still = await asyncio.wait(old_tasks, timeout=60)
+                if still:
+                    for t in still:
+                        t.cancel()
+                    _, still = await asyncio.wait(still, timeout=15)
+                if still:
+                    raise RuntimeError(f"有 {len(still)} 个旧同步任务无法停止")
 
-            # 机器人建的帖子：数据库里记录的 + 论坛里实际存在的（防止有漏记的）
+            # 3. 先保存 Discord 管理员回复的来源记录（迁移时据此识别身份；删帖事件会清掉相关映射，所以要在删帖前）
+            self._backfill_mirror_origin()
+            self._commit()
+
+            # 4. 删除机器人建的帖子：数据库里记录的 + 论坛里实际存在的（防止有漏记的）
             thread_ids = {r.thread_id for r in self.db.query(DiscordThread).all() if r.thread_id}
             try:
                 for t in self.forum.threads:
@@ -1064,31 +1086,19 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
             except discord.HTTPException as e:
                 logger.warning(f"读取论坛帖子列表失败，只删除记录中的帖子：{e}")
             await report(f"🗑️ 正在删除 Discord 帖子（共 {len(thread_ids)} 个）…")
+            failed = []
             for n, thread_id in enumerate(sorted(thread_ids), 1):
-                try:
-                    thread = await self._fetch_thread(thread_id, fresh=True)
-                    await thread.delete()
-                except ThreadGone:
-                    pass
-                except discord.HTTPException as e:
-                    logger.warning(f"删除帖子 {thread_id} 失败：{e}")
+                if not await self._delete_thread_for_reset(thread_id):
+                    failed.append(thread_id)
                 if n % 20 == 0:
                     await report(f"🗑️ 正在删除 Discord 帖子 {n}/{len(thread_ids)}…")
+            if failed:
+                raise RuntimeError(f"有 {len(failed)} 个帖子删除失败（请检查机器人的「管理帖子」权限）")
 
-            # 只清空 Discord 同步自己的记录，TG 的用户、话题、消息映射不动
-            for model in (DiscordMessageMap, DiscordPost, DiscordOutbox, DiscordThread):
+            # 5. 在同一个事务里清空旧记录并保存新边界
+            self.db.query(DiscordOutbox).filter(DiscordOutbox.id <= old_outbox_max).delete(synchronize_session="fetch")
+            for model in (DiscordMessageMap, DiscordPost, DiscordThread):
                 self.db.query(model).delete(synchronize_session="fetch")
-            self._commit()
-            self._snippets.clear()
-            self._edit_seen.clear()
-            self._reactors.clear()
-
-            # 新的历史边界：到这一刻为止的全部消息都按历史重新迁移
-            marker = await self.bot.send_message(
-                admin_group_id,
-                "🔄 Discord 同步已重置，在此之前的全部消息会作为历史重新迁移到 Discord。",
-                message_thread_id=general_topic_id or None,
-            )
             row = self.db.get(BridgeState, "history_cutoff")
             if row is None:
                 row = BridgeState(key="history_cutoff")
@@ -1096,12 +1106,21 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
             row.value = str(marker.message_id)
             self._commit()
             self.history_cutoff = marker.message_id
+            self._snippets.clear()
+            self._edit_seen.clear()
+            self._reactors.clear()
+            self._reconcile_pending.clear()
             if self.history:
                 self.history.reset_index()
         except Exception as e:
             logger.exception("重置 Discord 同步失败")
             self._rollback()
-            return await report(f"❌ 重置失败：{e}\n可以再次发送 /dc_reset confirm 重试。")
+            if marker is not None:
+                with contextlib.suppress(Exception):
+                    await self.bot.edit_message_text(
+                        "（Discord 同步重置未完成，此消息可忽略）", chat_id=marker.chat_id, message_id=marker.message_id
+                    )
+            return await report(f"❌ 重置失败：{e}\n同步记录没有清空，可以再次发送 /dc_reset confirm 重试（会重新删除并完整迁移）。")
         finally:
             self._running.set()
 
@@ -1109,6 +1128,24 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
             return await report("✅ 已重置。未配置 TG_API_ID / TG_API_HASH，无法迁移历史；之后的新消息会正常同步。")
         await report("✅ 已重置，开始重新迁移历史…")
         await self.history.run(status_chat_id, status_message_id)
+
+    async def _delete_thread_for_reset(self, thread_id):
+        """删除成功或帖子已不存在返回 True；暂时性错误重试几次"""
+        for attempt in range(3):
+            try:
+                thread = await self._fetch_thread(thread_id, fresh=True)
+                await thread.delete()
+                return True
+            except ThreadGone:
+                return True
+            except discord.NotFound:
+                return True
+            except discord.HTTPException as e:
+                if not is_transient(e) or attempt == 2:
+                    logger.warning(f"删除帖子 {thread_id} 失败：{e}")
+                    return False
+                await asyncio.sleep(2 * (attempt + 1))
+        return False
 
     def _backfill_mirror_origin(self):
         """把现有 Discord 管理员回复在 TG 后台的镜像记入来源表（旧版本没有这张表）"""
