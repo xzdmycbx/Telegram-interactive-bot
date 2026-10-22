@@ -106,6 +106,19 @@ class DiscordMessageMap(Base):
     has_files = Column(Boolean, default=False)
 
 
+class DiscordMirrorOrigin(Base):
+    """TG 后台群里由 Discord 管理员回复镜像过来的消息（可信来源记录）。
+
+    历史迁移据此识别 Discord 管理员的回复，不能凭正文格式判断（用户可以伪造）。
+    /dc_reset 不清空这张表。
+    """
+
+    __tablename__ = "discord_mirror_origin"
+    id = Column(Integer, primary_key=True, index=True)
+    group_chat_message_id = Column(Integer, unique=True, index=True)
+    author = Column(String(128))
+
+
 class DiscordOutbox(Base):
     """已入队但尚未完成的同步任务；重启后补发"""
 

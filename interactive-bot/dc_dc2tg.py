@@ -6,6 +6,8 @@ import html
 import os
 import tempfile
 import uuid
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import discord
 from telegram import (
@@ -51,6 +53,18 @@ from .utils import get_topic_status
 _VIDEO_EXTS = (".webm", ".mkv", ".avi", ".wmv", ".flv", ".mpg", ".mpeg", ".3gp", ".ts", ".m2ts")
 # 长文本按这个长度分段（给后台镜像的标题行留余量，用户和后台的分段保持一致）
 TEXT_CHUNK = TG_TEXT_LIMIT - 200
+# 转发卡片里的图片只从 Discord 自己的域名下载，防止被引导去访问内网地址（SSRF）
+_DISCORD_MEDIA_HOSTS = ("discordapp.com", "discordapp.net", "discord.com")
+# 入队超过这么久才执行时，重新从服务器确认发送者权限
+STALE_PERMISSION_SECONDS = 60
+
+
+def _is_discord_media(url):
+    u = urlparse(url or "")
+    host = (u.hostname or "").lower()
+    return u.scheme == "https" and any(host == h or host.endswith("." + h) for h in _DISCORD_MEDIA_HOSTS)
+
+
 STAGE_USER_SENT, STAGE_DONE = 1, 2
 
 
@@ -132,7 +146,23 @@ class DiscordToTgMixin:
             return
         self._remember(message.id, message.author.display_name, message.content or "[附件]")
         outbox_id = self._outbox_add(user_id, "dc", {"thread_id": channel.id, "message_id": message.id})
-        self._submit_outbox(user_id, outbox_id, lambda: self._dc_to_tg(user_id, message), "dc→tg")
+        self._submit_outbox(user_id, outbox_id, self._authorized(message, lambda: self._dc_to_tg(user_id, message)), "dc→tg")
+
+    def _authorized(self, message, factory):
+        """每次执行（包括队内重试）前确认发送者仍有权限；重试或排队较久时从服务器重新获取角色"""
+        attempts = [0]
+
+        async def run():
+            attempts[0] += 1
+            created = getattr(message, "created_at", None)
+            age = (datetime.now(timezone.utc) - created).total_seconds() if created else 0
+            fresh = attempts[0] > 1 or age > STALE_PERMISSION_SECONDS
+            if not await self._author_allowed(message, fresh=fresh):
+                logger.warning(f"发送者已无权限，跳过 Discord 消息 {message.id}")
+                return None
+            return await factory()
+
+        return run
 
     async def _dc_notice(self, message, text):
         try:
@@ -170,8 +200,8 @@ class DiscordToTgMixin:
                     fp.write(chunk)
         return path
 
-    async def _download_bytes(self, url, limit):
-        async with self.http.get(url, proxy=self.proxy) as resp:
+    async def _download_bytes(self, url, limit, allow_redirects=True):
+        async with self.http.get(url, proxy=self.proxy, allow_redirects=allow_redirects) as resp:
             resp.raise_for_status()
             data = b""
             async for chunk in resp.content.iter_chunked(256 * 1024):
@@ -258,11 +288,16 @@ class DiscordToTgMixin:
 
     async def _embed_items(self, embed):
         """转发的卡片里的图片下载后作为图片发送，不把 Discord 链接直接发给用户"""
-        url = (embed.image and embed.image.url) or (embed.thumbnail and embed.thumbnail.url)
+        # 优先用 Discord 媒体代理的地址（Discord 已经替我们取过图）；原地址只接受 Discord 自己的域名
+        candidates = []
+        for media in (embed.image, embed.thumbnail):
+            if media:
+                candidates += [getattr(media, "proxy_url", None), getattr(media, "url", None)]
+        url = next((u for u in candidates if _is_discord_media(u)), None)
         if not url:
             return []
         try:
-            data = await self._download_bytes(url, TG_PHOTO_LIMIT)
+            data = await self._download_bytes(url, TG_PHOTO_LIMIT, allow_redirects=False)
         except Exception as e:
             if is_transient(e):
                 raise
@@ -438,6 +473,7 @@ class DiscordToTgMixin:
             rows[role] = (mm, dmm)
 
         def on_group(role, msg):
+            self._record_mirror_origin(msg.message_id, message.author.display_name)
             if role in rows:
                 mm, dmm = rows[role]
                 mm.group_chat_message_id = dmm.group_chat_message_id = msg.message_id
@@ -505,17 +541,20 @@ class DiscordToTgMixin:
                 .all()
             )
             pending = [r for r in rows if not r.group_chat_message_id]
+            author = post.username or "Discord"
             if pending:
                 self._check_alive()
-                header = _header(post.username or "Discord")
-                await self._tg_retry(
+                header = _header(author)
+                sent = await self._tg_retry(
                     lambda: self.bot.send_message(admin_group_id, header[0], parse_mode=ParseMode.HTML, message_thread_id=tg_thread)
                 )
+                self._record_mirror_origin(sent.message_id, author)
             for row in pending:
                 self._check_alive()
                 copied = await self._tg_retry(
                     lambda: self.bot.copy_message(admin_group_id, user_id, row.user_chat_message_id, message_thread_id=tg_thread)
                 )
+                self._record_mirror_origin(copied.message_id, author)
                 row.group_chat_message_id = copied.message_id
                 self.db.query(MessageMap).filter(
                     MessageMap.user_id == user_id, MessageMap.user_chat_message_id == row.user_chat_message_id
@@ -744,7 +783,9 @@ class DiscordToTgMixin:
         if not self._is_admin(message.author):
             return
         outbox_id = self._outbox_add(user_id, "dc_edit", {"thread_id": payload.channel_id, "message_id": payload.message_id})
-        self._submit_outbox(user_id, outbox_id, lambda: self._dc_edit_job(user_id, message, edited_at), "dc→tg edit")
+        self._submit_outbox(
+            user_id, outbox_id, self._authorized(message, lambda: self._dc_edit_job(user_id, message, edited_at)), "dc→tg edit"
+        )
 
     def _mark_edit_seen(self, message_id, edited_at):
         self._edit_seen[message_id] = edited_at
@@ -791,6 +832,7 @@ class DiscordToTgMixin:
         u = self.db.query(User).filter(User.user_id == user_id).first()
         tg_thread = u.message_thread_id if u else 0
         first = texts[0]
+        author = header[1].removeprefix("💬 ").removesuffix(" · Discord")
         for k, (h, p) in enumerate(chunks):
             self._check_alive()
             if k < len(texts):
@@ -800,7 +842,7 @@ class DiscordToTgMixin:
                     await self._edit_tg_text(admin_group_id, row.group_chat_message_id, "text", h, p, header if k == 0 else None)
                 elif tg_thread and first.group_chat_message_id:
                     # 上次追加时后台那条没发成功：补发
-                    await self._send_segment_to_group(row, h, p, first, tg_thread)
+                    await self._send_segment_to_group(row, h, p, first, tg_thread, author)
                 continue
             user_msg = await self._with_parse_fallback(
                 lambda v, pm: self.bot.send_message(
@@ -824,7 +866,7 @@ class DiscordToTgMixin:
             self.db.add(row)
             self._commit()
             if tg_thread and first.group_chat_message_id:
-                await self._send_segment_to_group(row, h, p, first, tg_thread)
+                await self._send_segment_to_group(row, h, p, first, tg_thread, author)
         for row in texts[len(chunks):]:
             for chat_id, mid in ((user_id, row.user_chat_message_id), (admin_group_id, row.group_chat_message_id)):
                 if mid:
@@ -832,7 +874,7 @@ class DiscordToTgMixin:
             self.db.delete(row)
             self._commit()
 
-    async def _send_segment_to_group(self, row, h, p, first, tg_thread):
+    async def _send_segment_to_group(self, row, h, p, first, tg_thread, author):
         group_msg = await self._with_parse_fallback(
             lambda v, pm: self.bot.send_message(
                 admin_group_id, v, parse_mode=pm, message_thread_id=tg_thread,
@@ -840,6 +882,7 @@ class DiscordToTgMixin:
             ),
             h, p,
         )
+        self._record_mirror_origin(group_msg.message_id, author)
         row.group_chat_message_id = group_msg.message_id
         self.db.query(MessageMap).filter(
             MessageMap.user_id == row.user_id, MessageMap.user_chat_message_id == row.user_chat_message_id
@@ -905,6 +948,7 @@ class DiscordToTgMixin:
             new_rows[role] = (new, mm)
 
         def on_group(role, msg):
+            self._record_mirror_origin(msg.message_id, header[1].removeprefix("💬 ").removesuffix(" · Discord"))
             if role in new_rows:
                 new, mm = new_rows[role]
                 new.group_chat_message_id = mm.group_chat_message_id = msg.message_id

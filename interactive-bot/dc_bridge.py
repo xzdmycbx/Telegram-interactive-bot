@@ -29,6 +29,7 @@ from telegram.error import BadRequest
 from db.model import (
     BridgeState,
     DiscordMessageMap,
+    DiscordMirrorOrigin,
     DiscordOutbox,
     DiscordPost,
     DiscordThread,
@@ -510,18 +511,18 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
             except Exception:
                 logger.exception("定时补发失败")
 
-    async def _author_allowed(self, message):
-        """补发时重新确认发送者当前仍有权限"""
+    async def _author_allowed(self, message, fresh=True):
+        """执行时确认发送者当前仍有权限。fresh：从服务器重新获取成员角色，不用入队时的快照"""
         author = message.author
         if getattr(author, "bot", False) or getattr(message, "webhook_id", None):
             return False
         if not self.admin_role_ids:
             return True
-        if isinstance(author, discord.Member):
+        if not fresh and isinstance(author, discord.Member):
             return self._is_admin(author)
         guild = self.forum.guild
         try:
-            member = guild.get_member(author.id) or await guild.fetch_member(author.id)
+            member = await guild.fetch_member(author.id)
         except discord.NotFound:
             return False
         return self._is_admin(member)
@@ -1108,3 +1109,32 @@ class DiscordBridge(TgToDiscordMixin, DiscordToTgMixin):
             return await report("✅ 已重置。未配置 TG_API_ID / TG_API_HASH，无法迁移历史；之后的新消息会正常同步。")
         await report("✅ 已重置，开始重新迁移历史…")
         await self.history.run(status_chat_id, status_message_id)
+
+    def _backfill_mirror_origin(self):
+        """把现有 Discord 管理员回复在 TG 后台的镜像记入来源表（旧版本没有这张表）"""
+        known = {r.group_chat_message_id for r in self.db.query(DiscordMirrorOrigin.group_chat_message_id).all()}
+        posts = {p.id: p.username for p in self.db.query(DiscordPost).filter(DiscordPost.source.like("dc:%")).all()}
+        rows = (
+            self.db.query(DiscordMessageMap)
+            .filter(DiscordMessageMap.origin == "dc_admin", DiscordMessageMap.group_chat_message_id.isnot(None))
+            .all()
+        )
+        for r in rows:
+            if r.group_chat_message_id not in known:
+                self.db.add(
+                    DiscordMirrorOrigin(group_chat_message_id=r.group_chat_message_id, author=posts.get(r.post_id) or "Discord")
+                )
+                known.add(r.group_chat_message_id)
+
+    def _record_mirror_origin(self, group_message_id, author):
+        """记录一条 Discord 管理员回复在 TG 后台的镜像（可信来源，历史迁移据此识别身份）"""
+        if not group_message_id:
+            return
+        exists = (
+            self.db.query(DiscordMirrorOrigin)
+            .filter(DiscordMirrorOrigin.group_chat_message_id == group_message_id)
+            .first()
+        )
+        if not exists:
+            self.db.add(DiscordMirrorOrigin(group_chat_message_id=group_message_id, author=author))
+            self._commit()

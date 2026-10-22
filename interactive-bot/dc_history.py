@@ -18,7 +18,7 @@ from telethon.tl.types import (
     MessageMediaStory,
 )
 
-from db.model import DiscordMessageMap, MessageMap, User
+from db.model import DiscordMessageMap, DiscordMirrorOrigin, MessageMap, User
 
 from . import general_topic_id
 from .dc_avatar import DEFAULT_DISCORD
@@ -44,7 +44,7 @@ from .dc_format import (
 BATCH = 100
 # 同一发送者连续发言超过这个间隔才再次显示时间
 TIME_GAP = 5 * 60
-# Discord 管理员的回复镜像到 TG 后台时，首行是「💬 名字 · Discord」
+# Discord 管理员的回复镜像到 TG 后台时，首行是「💬 名字 · Discord」（只用于去掉标题，身份以来源表为准）
 _DC_HEADER = re.compile(r"^💬 (.+) · Discord$")
 
 
@@ -84,11 +84,13 @@ class TgHistory:
         self._index_lock = asyncio.Lock()
         self._index = None  # user_id -> [群消息ID]
         self._group_to_user_msg = {}  # 群消息ID -> 用户侧消息ID
+        self._dc_origin = {}  # 群消息ID -> Discord 管理员名字（可信来源记录）
 
     def reset_index(self):
         """/dc_reset 改变了历史边界，下次需要重新扫描"""
         self._index = None
         self._group_to_user_msg = {}
+        self._dc_origin = {}
 
     async def _get_index(self, progress=None):
         """扫描后台群 1..cutoff 的全部消息，建立 用户 → 历史消息ID 的索引（每次进程只扫一次）"""
@@ -119,6 +121,10 @@ class TgHistory:
             rows = self.db.query(MessageMap).filter(MessageMap.group_chat_message_id <= cutoff).all()
             user_by_group_msg = {r.group_chat_message_id: r.user_id for r in rows}
             self._group_to_user_msg = {r.group_chat_message_id: r.user_chat_message_id for r in rows}
+            self._dc_origin = {
+                r.group_chat_message_id: r.author
+                for r in self.db.query(DiscordMirrorOrigin).filter(DiscordMirrorOrigin.group_chat_message_id <= cutoff)
+            }
 
             index = defaultdict(list)
             orphan = 0
@@ -167,7 +173,7 @@ class TgHistory:
         for source, m in enumerate(unit):
             if m.message:
                 text, ents = m.message, ents_from_telethon(m.entities)
-                if self._dc_author(m) is not None:
+                if self._dc_author(m) is not None and _DC_HEADER.match(text.split("\n", 1)[0]):
                     text, ents = _strip_first_line(text, ents)
                 if text:
                     out.bodies[source] = tg_to_discord(text, ents)
@@ -243,11 +249,11 @@ class TgHistory:
         return out
 
     def _dc_author(self, m):
-        """后台群里由 Discord 管理员回复镜像过来的消息：返回该管理员的名字"""
-        if m.sender_id != self.mtproto.bot_id or not m.message:
+        """后台群里由 Discord 管理员回复镜像过来的消息：返回该管理员的名字。
+        只认来源表里的记录，不看正文（用户发来的消息同样由机器人转到后台，正文可以伪造）"""
+        if m.sender_id != self.mtproto.bot_id:
             return None
-        match = _DC_HEADER.match(m.message.split("\n", 1)[0])
-        return match.group(1) if match else None
+        return self._dc_origin.get(m.id)
 
     def _label(self, m, user_name):
         """返回 (webhook 昵称, 发送者类型 user / dc_admin / system / tg_admin)"""
@@ -347,6 +353,8 @@ class TgHistory:
             if target:
                 prefix.append(await self.bridge._reply_line(target.discord_thread_id, target.discord_message_id))
         out = self.out_from_telethon(unit)
+        if kind == "dc_admin" and not (out.bodies or out.files or out.extras):
+            return  # 只有标题行的消息（补发后台镜像时单独发的标题），没有内容
         if pairs is None:
             pairs = [(self._group_to_user_msg.get(m.id), m.id) for m in unit]
         await self.bridge._post_recover(
