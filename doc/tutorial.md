@@ -11,7 +11,7 @@
 4. [申请 Telegram API（api_id / api_hash）](#4-申请-telegram-apiapi_id--api_hash)
 5. [准备 Discord（可选）](#5-准备-discord可选)
 6. [填写配置 `.env`](#6-填写配置-env)
-7. [用 Docker 部署运行](#7-用-docker-部署运行)
+7. [用 Docker 部署运行](#7-用-docker-部署运行)（含 Discord 头像设置）
 8. [首次启动检查](#8-首次启动检查)
 9. [迁移历史记录到 Discord](#9-迁移历史记录到-discord)
 10. [日常使用](#10-日常使用)
@@ -216,6 +216,10 @@ DISCORD_FORUM_CHANNEL_ID=123456789012345678
 TG_API_ID=1234567
 TG_API_HASH=0123456789abcdef0123456789abcdef
 
+# ===== Discord 显示用户真实头像（可选，见第 7.5 步）=====
+# AVATAR_PUBLIC_URL=https://avatar.example.com
+# AVATAR_PORT=8080
+
 # ===== 代理（国内服务器 / 本地才需要，见第 7.4 步）=====
 # HTTPS_PROXY=http://host.docker.internal:7890
 ```
@@ -268,6 +272,34 @@ HTTPS_PROXY=http://host.docker.internal:端口
 - **Windows / macOS（Docker Desktop）** 一般直接可用；**Linux** 需要在代理软件里开启「允许局域网连接」（监听 `0.0.0.0`），容器才能访问到宿主机上的代理。
 - 海外服务器不需要配置代理。
 
+### 7.5 让 Discord 显示用户头像
+
+Discord 上用户和 TG 管理员的消息是用 webhook 发的：用户名旁边固定会有一个 **APP** 标记（Discord 的规定，无法去掉），头像则必须是一个**公网能直接访问的图片地址**。Telegram 头像没有这样的公开地址，所以程序按下面的顺序找头像：
+
+1. **配置了 `AVATAR_PUBLIC_URL`**：程序自带一个小型头像服务，所有用户都能显示真实头像（隐藏了头像的用户除外）。
+2. **没配置**：设置了公开用户名、并且头像对所有人可见的用户，自动使用 Telegram 官方的公开头像；
+3. **都拿不到**：用 Discord 的默认头像（用户蓝色、TG 管理员绿色；系统消息用 Discord 机器人自己的头像）。
+
+所以**不配置也能用**，只是部分用户显示默认头像。想让所有人都显示真实头像，需要一个公网能访问的地址（只有放在有公网 IP 的服务器上才可行，家里电脑一般不行）：
+
+1. `.env` 里填写：
+   ```ini
+   AVATAR_PUBLIC_URL=https://avatar.example.com
+   AVATAR_PORT=8080
+   ```
+2. `docker-compose.yml` 里取消 `ports` 那两行的注释（`"8080:8080"`，与 `AVATAR_PORT` 一致）。
+3. 推荐用域名 + HTTPS：把域名解析到服务器，用 Caddy / Nginx 反向代理到 `127.0.0.1:8080`。Caddy 的配置只要一行：
+   ```
+   avatar.example.com {
+       reverse_proxy 127.0.0.1:8080
+   }
+   ```
+   没有域名也可以直接填 `http://服务器IP:8080`（记得在防火墙 / 安全组放行端口）。
+4. 重启后访问 `https://avatar.example.com/healthz`，显示 `ok` 就说明通了。
+
+> 头像地址带签名，别人无法通过修改地址获取其他用户的头像；用户换了头像，地址也会随之变化。头像缓存在 `assets/avatars/` 里。
+> 已经发到 Discord 的旧消息不会补上头像；想让旧记录也带头像，见第 9 步的「重新迁移」。
+
 ---
 
 ## 8. 首次启动检查
@@ -297,6 +329,25 @@ HTTPS_PROXY=http://host.docker.internal:端口
 - **只迁移某个用户**：在该用户的话题里发送 `/dc_migrate`。
 - 中途中断（重启、报错）没关系，再发一次 `/dc_migrate` 会从断点继续，已迁移的不会重复。
 - 迁移后的消息带原始时间（Discord 按查看者的时区显示），引用回复、相册、话题关闭记录都会保留；之前已关闭的对话，帖子会保持锁定。
+- 迁移会自动控制发送速度（每分钟约 28 条），不会去撞 Discord 的限流，所以消息多时需要一些时间，进度消息会一直更新。
+
+### 重新迁移（清空 Discord 后从头来）
+
+迁移到一半想推倒重来（比如刚配置好头像，想让历史记录也带上头像），**不需要动数据库**，在后台群 General 发送：
+
+```
+/dc_reset confirm
+```
+
+（只发 `/dc_reset` 会先显示说明，不会执行。）它会依次：
+
+1. 暂停同步，作废所有进行中的同步任务；
+2. 删除 Discord 论坛里**机器人创建的所有帖子**；
+3. 清空 Discord 侧的同步记录（Telegram 这边的用户、话题、消息记录都不受影响）；
+4. 在后台群发一条「🔄 Discord 同步已重置」，**到这一刻为止的全部消息**（包括之前已经实时同步过的、Discord 管理员发过的回复）都作为历史；
+5. 自动开始重新迁移，进度显示在同一条消息里。
+
+注意：重置后 Discord 里帖子的链接、表情回应会丢失（帖子是重新创建的）；论坛里人工发的其它帖子不会被删除。
 
 ---
 
@@ -314,6 +365,7 @@ HTTPS_PROXY=http://host.docker.internal:端口
 | 在话题里发送 `/clear` | 删除话题、Discord 帖子，以及（按配置）用户那边的聊天记录 |
 | 回复一条消息并发送 `/broadcast` | 把被回复的消息广播给所有用户 |
 | 在 General 发送 `/dc_migrate` | 迁移历史到 Discord（见第 9 步） |
+| 在 General 发送 `/dc_reset confirm` | 清空 Discord 侧并把全部消息重新迁移（见第 9 步） |
 
 ### 10.2 Discord 论坛
 
@@ -379,6 +431,9 @@ HTTPS_PROXY=http://host.docker.internal:端口
 | `/dc_migrate` 提示未配置 | 填好 `TG_API_ID` / `TG_API_HASH` 后重启 |
 | 迁移报告里有失败用户 | 看日志里的原因，修好后再发一次 `/dc_migrate`，会从断点继续 |
 | 国内网络连不上 | 配置第 7.4 步的代理；Linux 记得开代理软件的「允许局域网连接」 |
+| 日志里 `Sleeping for 29s … flood wait` | 正常。迁移时读取历史消息触发了 Telegram 的频率限制，程序会自动等待后继续，只是变慢 |
+| 日志里 `Webhook ID … is rate limited` | 偶尔出现无害（会自动重试）。程序已主动控制发送速度，频繁出现时请检查是否有别的程序在用同一个 webhook |
+| Discord 上消息只显示默认头像和 APP 标记 | APP 标记无法去掉；头像见第 7.5 步。旧消息想补上头像可用 `/dc_reset confirm` 重新迁移 |
 
 > Discord 暂时连不上不会影响 Telegram 后台的正常使用。期间的同步任务会保存下来，恢复后自动补发。
 
